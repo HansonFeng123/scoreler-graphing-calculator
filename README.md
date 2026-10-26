@@ -29,3 +29,7 @@ Use Node.js, run `npm install`, then `npm run build`. Package only manifest.json
 
 这是基于 Anthony Foster 的 Equation.io（MIT 许可）的 Scoreler 离线图形计算器插件。原作者、上游链接及完整许可保留在源码和界面中。目标是接近 Desmos 的学习绘图流程，但不是完全兼容的克隆，表达式采用 Equation.io 语法。支持范围和限制见上文；关闭窗口后不保存图形。网络、云端分享、文件导入导出、剪贴板集成及后台工作线程求解器不可用。
 
+
+## 1.1.0
+
+Adds guided graph presets with English/Chinese labels for parabolas, circles, inequalities, sliders, a linear regression example and reset. The engine and offline sandbox remain the same.
