@@ -1,0 +1,1969 @@
+import { type FigureForm, mapChildren } from './expr.ts';
+/**
+ * Point (2D and 3D vector) values and geometry statements.
+ *
+ * A constant whose right-hand side is a pair or triple — `A = (0, 0)`, `C = B + D` —
+ * is a named point. A pair that depends on x, y, or z (`s = (x, y)`) is a
+ * vector field: the same name still expands here, and `dot(s, s) = 1` is the
+ * unit circle. Point arithmetic (±, scalar ×/÷, dot, cross, perp,
+ * midpoint, unit, distance, angle, |P|) is lowered here into componentwise scalar expressions,
+ * with a point name `A` expanding to the derived constants `A_x`, `A_y` (and `A_z` in space).
+ * Lowering runs after resolveExpr (functions inlined, Σ expanded) and before
+ * classify, so everything downstream — GLSL, evaluate, diff — still sees only
+ * scalars, and points stay symbolic all the way to uniforms (dragging a point
+ * never recompiles a shader).
+ *
+ * The statement forms segment/polyline/vector/polygon/square desugar to an
+ * internal '[polygon]'-style call holding a flat scalar vertex list (classify
+ * turns it into a CPU-drawn polygon plot); line and circle desugar to ordinary
+ * implicit equations.
+ *
+ * Geometry calls preserve grouped tuple literals, so 2D and 3D arguments
+ * retain their dimensions. Adjacent ungrouped scalar arguments still pair
+ * into 2D points for compatibility.
+ */
+import { add, div, mul, neg, sub } from './diff.ts';
+import { ANGLE_FN, MAP, type Expr, compArity, compDims, compFits, isRecur, sameList } from './expr.ts';
+import { SCALAR_REDUCTIONS, tupleAxis, withAxes } from './list.ts';
+import {
+  type GetMat,
+  type Mat,
+  type MatValue,
+  detOf,
+  expOf,
+  hatOf,
+  matAdd,
+  matMul,
+  matNeg,
+  matPow,
+  matScale,
+  matVec,
+  matrixFromRows,
+  SHAPE_HINT,
+  solveVec,
+  traceOf,
+  transposeOf,
+} from './mat.ts';
+import {
+  type GetTensor,
+  type Tensor,
+  contract,
+  fromMat,
+  outer,
+  product,
+  rows,
+  scalarTensor,
+  shapeText,
+  stack,
+  tensorAdd,
+  tensorNeg,
+  TENSOR_CALL,
+  tensorNode,
+  tensorOfNode,
+  tensorScale,
+  toMat,
+  vectorTensor,
+  wedge,
+} from './tensor.ts';
+import { actionNode } from './glyphs.ts';
+import {
+  type Flat,
+  PGA_CALL,
+  flatAngle,
+  flatDistance,
+  flatName,
+  flatNode,
+  flatOfNode,
+  hyperplane,
+  isPoint,
+  MOTOR,
+  motorPga,
+  moveFlat,
+  movePoint,
+  slerpMotor,
+  outerPga,
+  pointCoords,
+  pointPga,
+  project,
+  reflect,
+  regressivePga,
+} from './pga.ts';
+import {
+  type Multivector,
+  MV_CALL,
+  conjugate,
+  dual,
+  geometric,
+  gradePart,
+  gradesOf,
+  isScalar,
+  juliaSurface,
+  mvAdd,
+  mvExp,
+  mvNeg,
+  mvNode,
+  mvOfNode,
+  mvPower,
+  mvScale,
+  normSquared,
+  outerMv,
+  quaternion,
+  quaternionParts,
+  reverse,
+  sandwichMatrix,
+  scalarMv,
+  slerp,
+  vectorMv,
+} from './clifford.ts';
+
+/** Whole-statement geometry forms (like SPECIAL_FORMS, they never nest). */
+export const GEOM_STATEMENTS = new Set([
+  'segment',
+  'polyline',
+  'vector',
+  'line',
+  'polygon',
+  'square',
+  'circle',
+  'hull',
+]);
+
+/** The derived scalar constants a point named `name` expands to. */
+export const pointComps = (name: string, dim = 2): string[] =>
+  ['x', 'y', 'z'].slice(0, dim).map(axis => name + '_' + axis);
+
+/** The derived scalar states an n-vector state expands to: om_1, om_2(, om_3). */
+export const vecStateComps = (name: string, dim: number): string[] =>
+  Array.from({ length: dim }, (_, k) => `${name}_${k + 1}`);
+
+/** A vector value under lowering: 2 components (a point) or 3 (a 3-vector). */
+type LV = { vec: false; e: Expr } | { vec: true; items: Expr[] };
+
+const sc = (e: Expr): LV => ({ vec: false, e });
+const vc = (...items: Expr[]): LV => ({ vec: true, items });
+const toExpr = (v: LV): Expr => (v.vec ? { kind: 'vec', items: v.items } : v.e);
+
+/**
+ * Component names for a vector-valued definition, or null for scalars.
+ * Named points return [A_x, A_y]; vector states return [om_1, om_2(, om_3)].
+ */
+export type GetComps = (name: string) => readonly string[] | null;
+
+/** Whether a name is a list (so a measurement or figure can say lists wait). */
+type IsList = (name: string) => boolean;
+
+/** Functions over points, by how many point arguments they take. */
+const POINT_FNS: Record<string, number> = { dot: 2, cross: 2, midpoint: 2, perp: 1, unit: 1 };
+const ROTATE_USAGE =
+  'rotate takes rotate(P, angle), rotate(P, angle, center) in 2D, or rotate(P, angle) about z and rotate(P, angle, axis) in 3D.';
+
+const sq = (e: Expr): Expr => mul(e, e);
+const lenOfN = (items: Expr[]): Expr => {
+  let s = sq(items[0]);
+  for (let k = 1; k < items.length; k++) s = add(s, sq(items[k]));
+  return { kind: 'call', name: 'sqrt', args: [s] };
+};
+
+/** Both vectors, same length — the shape componentwise arithmetic needs. */
+function sameDims(op: string, a: LV, b: LV): asserts a is LV & { vec: true } {
+  if (!a.vec || !b.vec) return;
+  if (a.items.length !== b.items.length) {
+    throw new Error(`Cannot ${op} a ${a.items.length}-component and a ${b.items.length}-component vector.`);
+  }
+}
+
+/** Re-pair a lowered argument list into vectors of any dimension: vec args
+ *  pass through, adjacent scalars (a flattened tuple literal) join into a 2D
+ *  point. A scalar left without a partner throws `stray` — a message, or one
+ *  made from that argument's index. */
+function legacyPointArgs(args: LV[], stray: string | ((index: number) => string)): Expr[][] {
+  const vs: Expr[][] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.vec) {
+      vs.push(a.items);
+      continue;
+    }
+    const b = args[i + 1];
+    if (!b || b.vec) throw new Error(typeof stray === 'string' ? stray : stray(i));
+    vs.push([a.e, b.e]);
+    i++;
+  }
+  return vs;
+}
+
+/** legacyPointArgs for the figures, which are 2D only. `usage` is the argument list
+ *  shown in the error, e.g. 'A' or 'A, B'. */
+function pairPoints(name: string, args: LV[], usage: string): Array<[Expr, Expr]> {
+  const vs = legacyPointArgs(args, `${name} takes points — write ${name}(${usage}), with A = (0, 0) defined above.`);
+  const big = vs.find(v => v.length !== 2);
+  if (big) throw new Error(`${name} takes 2D points, not ${big.length}-component vectors.`);
+  return vs as Array<[Expr, Expr]>;
+}
+
+/** An argument that is itself a list: a literal, a named list, or a named
+ *  matrix, read as its rows. (A list deeper inside — (L, 0),
+ *  total(L), M A — is a scalar or a point by the time it matters.) */
+const isListArg = (a: Expr, getMat: GetMat, isList: IsList): boolean =>
+  a.kind === 'list' || a.kind === 'data' || (a.kind === 'var' && (isList(a.name) || getMat(a.name) !== null));
+
+/** Why an argument that failed to be a point is list-shaped, if it is: a
+ *  'list' value (L, 2L, -P, sort(L), sin(L)) or one 'element' of a list
+ *  (P[1]). A reduction is one number, so total(L) is neither. */
+function listShape(a: Expr, getMat: GetMat, isList: IsList): 'list' | 'element' | null {
+  if (isListArg(a, getMat, isList)) return 'list';
+  const first = (es: readonly Expr[]) => es.map(x => listShape(x, getMat, isList)).find(s => s !== null) ?? null;
+  switch (a.kind) {
+    case 'neg':
+      return first([a.a]);
+    case 'bin':
+      return first([a.a, a.b]);
+    case 'index':
+      return 'element';
+    case 'call':
+      if (SCALAR_REDUCTIONS.has(a.name) || ((a.name === 'min' || a.name === 'max') && a.args.length === 1)) return null;
+      return first(a.args);
+    default:
+      return null;
+  }
+}
+
+const DISTANCE_USAGE =
+  'distance takes two points: distance(A, B) with A = (0, 0) defined above, or distance((0, 0), (3, 4)).';
+const ANGLE_USAGE =
+  'angle takes three matching points — angle(A, B, C), the angle at B — or two vectors: angle(U, V). Points may be 2D or 3D.';
+
+/** distance(A, B) ≡ |A - B|, in any dimension |A - B| has. `usage` is thrown
+ *  for every arity failure: tuple literals arrive flattened — (1, 2, 3) is
+ *  three loose scalars — so it is the one message true however they pair. */
+function lowerDistance(args: LV[], usage: string, stray: (index: number) => string): Expr {
+  const vs = legacyPointArgs(args, stray);
+  if (vs.length !== 2) throw new Error(usage);
+  const [p, q] = vs;
+  if (p.length !== q.length) {
+    throw new Error(`distance needs points with the same number of components, not ${p.length} and ${q.length}.`);
+  }
+  return lenOfN(p.map((pk, k) => sub(pk, q[k])));
+}
+
+/** angle(A, B, C), the angle at B turning from B→A to B→C, or angle(U, V):
+ *  signed, counterclockwise positive, in (−π, π]. It lowers to one internal
+ *  call over the two arms' components (see angleFn), so each component
+ *  appears once however large it is. */
+function lowerAngle(args: LV[], usage: string, stray: (index: number) => string): Expr {
+  const vs = legacyPointArgs(args, stray);
+  if (vs.length !== 2 && vs.length !== 3) throw new Error(usage);
+  const dim = vs[0].length;
+  if ((dim !== 2 && dim !== 3) || vs.some(v => v.length !== dim))
+    throw new Error('angle needs points with matching dimensions.');
+  const [u, v] = vs.length === 3 ? [vs[0].map((c, k) => sub(c, vs[1][k])), vs[2].map((c, k) => sub(c, vs[1][k]))] : vs;
+  if (dim === 3) {
+    const cross = u.map((_, k) => sub(mul(u[(k + 1) % 3], v[(k + 2) % 3]), mul(u[(k + 2) % 3], v[(k + 1) % 3])));
+    const dot = u.map((c, k) => mul(c, v[k])).reduce(add);
+    const valid = { kind: 'ineq', op: '>', l: mul(lenOfN(u), lenOfN(v)), r: { kind: 'num', value: 0 } } as Expr;
+    return {
+      kind: 'piecewise',
+      cases: [{ cond: valid, value: { kind: 'call', name: 'atan2', args: [lenOfN(cross), dot] } }],
+    };
+  }
+  return { kind: 'call', name: ANGLE_FN, args: [...u, ...v] };
+}
+
+/** Names a row cannot define, with what they already are (see RESERVED in
+ *  defs.ts): `v = (1, 2, 3)` is an equation in v, which says so. (x, y and
+ *  z are left out: `y = A` is an equation, and its mismatch is the news.) */
+const TAKEN_NAMES: Record<string, string> = {
+  u: 'a built-in parameter running over [0, 1]',
+  v: 'a built-in parameter running over [0, 1], like u',
+  t: 'time',
+  w: 'the complex variable x + iy',
+  i: 'the imaginary unit',
+  e: "Euler's number",
+};
+
+const NOT_A_VALUE =
+  'A matrix is not a value on its own — apply it to a vector, like M (x, y), or name it: R = e^(a J).';
+const isE = (e: Expr): boolean => (e.kind === 'var' && e.name === 'e') || (e.kind === 'num' && e.value === Math.E);
+
+/** Matrix-valued subexpressions met during one lowerGeom, so a long scalar
+ *  chain asks "is this a matrix?" once per node rather than once per level. */
+let matSeen = new WeakMap<Expr, MatValue | null>();
+/**
+ * Whether matrix algebra is live for this lowering. Nearly every row has no
+ * matrix in it, and asking "is this a matrix?" at every node of a huge one is
+ * real time — so lowering starts with the question switched off and costs
+ * nothing. The only ways a matrix can enter are a matrix NAME, a tuple of
+ * points and the generator cross(n); meeting any throws MatrixSeen, and the
+ * expression is lowered again with the question switched on.
+ */
+let matsPossible = false;
+/** The values `[comp]` nodes pick from, lowered once per lowerGeom however
+ *  many components ask: f(f(f(A))) shares its argument n^depth times over.
+ *  `wait` is a value that is no point yet but may be a list of them, left
+ *  (as `wait`) for list lowering. */
+let compSeen = new WeakMap<Expr, LV | { wait: Expr }>();
+/** Tensor-valued subexpressions met during one lowerGeom (see lowerTensor). */
+let tenSeen = new WeakMap<Expr, Tensor | null>();
+/** Multivector-valued subexpressions met during one lowerGeom (see lowerMv). */
+let mvSeen = new WeakMap<Expr, Multivector | null>();
+/** Points, lines and planes met during one lowerGeom (see lowerFlat). */
+let flatSeen = new WeakMap<Expr, Flat | null>();
+/** Named tensors for the lowering under way. Like the caches above it lives
+ *  for one call: lowering is synchronous, and threading it through every
+ *  recursive call would touch every caller of lower() for one lookup. */
+let tensorNamed: GetTensor = () => null;
+let listNamed: IsList = () => false;
+class MatrixSeen extends Error {}
+function fresh(getTensor: GetTensor, isList: IsList, possible: boolean): void {
+  matSeen = new WeakMap();
+  compSeen = new WeakMap();
+  tenSeen = new WeakMap();
+  mvSeen = new WeakMap();
+  flatSeen = new WeakMap();
+  tensorNamed = getTensor;
+  listNamed = isList;
+  matsPossible = possible;
+}
+function withMatrices<T>(getTensor: GetTensor, isList: IsList, run: () => T): T {
+  fresh(getTensor, isList, false);
+  try {
+    return run();
+  } catch (err) {
+    if (!(err instanceof MatrixSeen)) throw err;
+    fresh(getTensor, isList, true);
+    return run();
+  }
+}
+
+/** ⊗, ∧ and their spellings outer(…), wedge(…), contract(…): a tensor operation.
+ *  (So is a tensor value already made, such as the total of a multiset of them.) */
+const tensorOp = (e: Expr): boolean =>
+  (e.kind === 'bin' && (e.glyph === 'outer' || e.glyph === 'wedge')) ||
+  (e.kind === 'call' && (e.name === 'outer' || e.name === 'wedge' || e.name === 'contract' || e.name === TENSOR_CALL));
+
+/** Whether a tuple literal holds a row that is no point — a longer tuple, or
+ *  a tuple of tuples — so it may be a tensor rather than a tuple of points. */
+const deepTupleRow = (e: Expr): boolean =>
+  e.kind === 'vec' && (e.items.length > 3 || e.items.some(it => it.kind === 'vec'));
+const deepTuple = (e: Expr): boolean => e.kind === 'vec' && e.items.some(deepTupleRow);
+
+const NOT_A_TENSOR_VALUE = (t: Tensor): string =>
+  `${shapeText(t.shape).replace('a', 'A')} is not a number or a point here — contract it, like contract(T, 1, 2), or give it a row of its own to read it.`;
+
+/** A constant whole-number argument, such as an index of contract. */
+function constIndex(e: Expr, what: string): number {
+  let v = NaN;
+  if (e.kind === 'num') v = e.value;
+  else if (e.kind === 'neg' && e.a.kind === 'num') v = -e.a.value;
+  if (!Number.isInteger(v)) throw new Error(`${what} is a whole number written out, like contract(T, 1, 2) or T[2].`);
+  return v;
+}
+
+/**
+ * A tensor-valued expression that matrix algebra alone cannot read: a
+ * tensor name, a nested tuple deeper or wider than a matrix, ⊗, ∧,
+ * contract, or algebra over any of them — or null. (A square matrix and its
+ * algebra stay lowerMat's, so every matrix path keeps its exact expressions
+ * and messages; the product of two tensors that happens to be square is
+ * handed back to it as a matrix.)
+ */
+function lowerTensor(e: Expr, lo: (n: Expr) => LV, getMat: GetMat): Tensor | null {
+  if (!matsPossible || lowerMv(e, lo)) return null;
+  if (tenSeen.has(e)) return tenSeen.get(e)!;
+  // A cycle guard: a node under way is not a tensor to itself.
+  tenSeen.set(e, null);
+  const of = (n: Expr): Tensor | null => lowerTensor(n, lo, getMat);
+  const found = ((): Tensor | null => {
+    switch (e.kind) {
+      case 'var':
+        return tensorNamed(e.name);
+      case 'vec': {
+        if (!e.items.some(it => of(it) || deepTupleRow(it))) return null;
+        const t = tupleTensor(e, lo, getMat);
+        // A tuple of points that is not square is a tuple of points (§3).
+        return t.shape.length === 2 && (t.shape[1] === 2 || t.shape[1] === 3) && !e.items.some(of) ? null : t;
+      }
+      case 'neg': {
+        const a = of(e.a);
+        return a && tensorNeg(a);
+      }
+      case 'bin': {
+        const any = (n: Expr) => anyTensor(n, lo, getMat);
+        if (e.glyph === 'outer' || e.glyph === 'wedge')
+          return (e.glyph === 'outer' ? outer : wedge)(any(e.a), any(e.b));
+        const a = of(e.a);
+        const b = of(e.b);
+        if (!a && !b) {
+          // T Q with T a tuple of points: the consumer reads it as a matrix
+          // (docs/multisets.md §3), n×k — the rectangular matvec and product.
+          // (Scaled, 2 T, it stays a tuple of points; on the right, M T, each
+          // of its points is moved.)
+          const l = e.op === '*' ? pointRows(e.a, lo, getMat) : null;
+          if (!l) {
+            // v T, a vector on the left of a tuple of points that is not
+            // square: the contraction v_i T_ij, a vector of T's width. (On
+            // a square matrix M v is the one order.)
+            const r = e.op === '*' ? pointRows(e.b, lo, getMat) : null;
+            if (!r || r.shape[0] === r.shape[1]) return null;
+            const v = lo(e.a);
+            return v.vec ? product(vectorTensor(v.items), r) : null;
+          }
+          const r = pointRows(e.b, lo, getMat) ?? lowerMat(e.b, lo, getMat);
+          const v = r ? null : lo(e.b);
+          if (r) return product(l, 'm' in r ? fromMat(r.m) : r);
+          return v?.vec ? product(l, vectorTensor(v.items)) : null;
+        }
+        switch (e.op) {
+          case '+':
+          case '-':
+            return tensorAdd(any(e.a), any(e.b), e.op === '-');
+          case '*': {
+            const l = any(e.a);
+            const r = any(e.b);
+            if (!l.shape.length) return tensorScale(r, l.data[0]);
+            if (!r.shape.length) return tensorScale(l, r.data[0]);
+            return product(l, r);
+          }
+          case '/': {
+            const r = any(e.b);
+            if (!a || r.shape.length) throw new Error('Cannot divide by a tensor.');
+            return tensorScale(a, { kind: 'bin', op: '/', a: { kind: 'num', value: 1 }, b: r.data[0] });
+          }
+        }
+        // (A power is matrix algebra: e^(th e_x ∧ e_y) is lowerMat's.)
+        return null;
+      }
+      case 'index': {
+        // T[k]: the k-th slice along the first index, as M[2] is a row.
+        const t = of(e.args[0]);
+        if (!t) return null;
+        const k = constIndex(e.args[1], 'A tensor index');
+        if (k < 1 || k > t.shape[0])
+          throw new Error(`That tensor has ${t.shape[0]} rows along its first index; ${k} is not one.`);
+        return rows(t)[k - 1];
+      }
+      case 'call': {
+        if (!tensorOp(e)) return null;
+        if (e.name === TENSOR_CALL) return tensorOfNode(e);
+        const any = (n: Expr) => anyTensor(n, lo, getMat);
+        if (e.name === 'contract') {
+          if (e.args.length !== 3) {
+            throw new Error('contract takes a tensor and two of its indices: contract(T, 1, 2) sums T_ii… over i.');
+          }
+          const [t, i, j] = e.args;
+          return contract(any(t), constIndex(i, 'An index') - 1, constIndex(j, 'An index') - 1);
+        }
+        if (e.args.length < 2) throw new Error(`${e.name} takes two or more vectors or tensors: ${e.name}(a, b).`);
+        const f = e.name === 'outer' ? outer : wedge;
+        return e.args.slice(1).reduce((acc, n) => f(acc, any(n)), any(e.args[0]));
+      }
+      default:
+        return null;
+    }
+  })();
+  tenSeen.set(e, found);
+  return found;
+}
+
+/** A tuple of points that is no square matrix — written out, or named — as
+ *  the rank-2 tensor of its rows; null for anything else. */
+function pointRows(n: Expr, lo: (n: Expr) => LV, getMat: GetMat): Tensor | null {
+  if (n.kind === 'var') {
+    const t = tensorNamed(n.name, true);
+    return t?.shape.length === 2 ? t : null;
+  }
+  if (n.kind !== 'vec' || n.items.length < 2 || lowerMat(n, lo, getMat)) return null;
+  const rows = n.items.map(lo);
+  if (!rows.every(r => r.vec)) return null;
+  return stack(rows.map(r => vectorTensor((r as LV & { vec: true }).items)));
+}
+
+/** A tuple literal read as a tensor: its rows, stacked. */
+function tupleTensor(e: Expr & { kind: 'vec' }, lo: (n: Expr) => LV, getMat: GetMat): Tensor {
+  const rows = e.items.map(it => anyTensor(it, lo, getMat));
+  const t = stack(rows);
+  if (!t) {
+    const shapes = [...new Set(rows.map(r => shapeText(r.shape)))];
+    throw new Error(`The rows of a tensor need one shape, not ${shapes.join(' and ')}.`);
+  }
+  return t;
+}
+
+/**
+ * Any value read as a tensor, for an operation on tensors: a number is rank
+ * 0, a point or a longer tuple rank 1, a matrix rank 2. A name that is a
+ * list is refused rather than read as a number, so the row is expanded
+ * element by element instead (object-lists.ts) — each point of it then a
+ * vector here.
+ */
+function anyTensor(n: Expr, lo: (n: Expr) => LV, getMat: GetMat): Tensor {
+  const t = lowerTensor(n, lo, getMat);
+  if (t) return t;
+  const m = lowerMat(n, lo, getMat);
+  if (m) return fromMat(m.m);
+  if (n.kind === 'vec' && n.items.length > 3) return tupleTensor(n, lo, getMat);
+  if (n.kind === 'var') {
+    // A tuple of points named earlier is a rank-2 tensor to ⊗ and ∧.
+    const tuple = tensorNamed(n.name, true);
+    if (tuple) return tuple;
+  }
+  const v = lo(n);
+  if (v.vec) return vectorTensor(v.items);
+  if (v.e.kind === 'vec') return tupleTensor(v.e, lo, getMat);
+  if (listShape(n, getMat, listNamed) === 'list') {
+    // (Unnamed, the row is expanded element by element and this never shows.)
+    throw new Error('A multiset of tensors cannot be named yet — write it on a row of its own.');
+  }
+  return scalarTensor(v.e);
+}
+
+/** The calls that make or take multivectors (lib/clifford.ts). */
+const MV_FNS = new Set(['gp', 'rev', 'grade', 'dual', 'quat', 'slerp', 'vec', MV_CALL]);
+
+/** Whether a subtree holds a multivector at all: a blade, ⟑ or a multivector
+ *  function. Rows without one — nearly all — skip lowerMv entirely. */
+const mvMark = new WeakMap<Expr, boolean>();
+function mvIn(e: Expr): boolean {
+  const hit = mvMark.get(e);
+  if (hit !== undefined) return hit;
+  let found = false;
+  switch (e.kind) {
+    case 'call':
+      found = MV_FNS.has(e.name) || e.args.some(mvIn);
+      break;
+    case 'bin':
+      found = e.glyph === 'geometric' || mvIn(e.a) || mvIn(e.b);
+      break;
+    case 'neg':
+      found = mvIn(e.a);
+      break;
+  }
+  mvMark.set(e, found);
+  return found;
+}
+
+const NOT_A_MV_VALUE =
+  'A multivector is not a number or a point here — grade(A, 1) is its vector part and |A| its size, or give it a row of its own to draw it.';
+
+/**
+ * A multivector-valued expression, or null: a blade (e_xy), quat(…), ⟑ and
+ * gp(…), and — once one side is a multivector — juxtaposition (the geometric
+ * product), ∧ (the outer product), +, −, division (by the inverse), whole
+ * powers, e^A, rev, dual, grade, slerp and |A|. Two plain vectors multiply
+ * as they always have: juxtaposition between them stays an error and ∧ the
+ * tensor wedge, so only ⟑ turns vectors into a multivector.
+ */
+function lowerMv(e: Expr, lo: (n: Expr) => LV): Multivector | null {
+  if (!mvIn(e)) return null;
+  if (mvSeen.has(e)) return mvSeen.get(e)!;
+  mvSeen.set(e, null);
+  const of = (n: Expr) => lowerMv(n, lo);
+  const any = (n: Expr) => anyMv(n, lo);
+  const found = ((): Multivector | null => {
+    switch (e.kind) {
+      case 'neg': {
+        const a = of(e.a);
+        return a && mvNeg(a);
+      }
+      case 'bin': {
+        if (e.glyph === 'geometric') return geometric(any(e.a), any(e.b));
+        if (e.op === '^') {
+          if (isE(e.a)) {
+            const p = of(e.b);
+            return p && mvExp(p);
+          }
+          const a = of(e.a);
+          if (!a) return null;
+          const n = e.b.kind === 'neg' && e.b.a.kind === 'num' ? -e.b.a.value : e.b.kind === 'num' ? e.b.value : NaN;
+          return mvPower(a, n);
+        }
+        const a = of(e.a);
+        const b = of(e.b);
+        if (!a && !b) return null;
+        if (e.glyph === 'dot' || e.glyph === 'cross' || e.glyph === 'outer') {
+          // grade(a ⟑ b, 1) · (1, 0): a multivector that is only a number or a
+          // vector takes these as that number or vector does, and 2 · e_xy
+          // multiplies as 2 · 3 does.
+          if (plainValue(a) && plainValue(b)) return null;
+          const n = e.glyph === 'dot' && !(a && b) ? lo(a ? e.b : e.a) : null;
+          if (n && !n.vec) return mvScale((a ?? b)!, n.e);
+          const sign = e.glyph === 'dot' ? '·' : e.glyph === 'cross' ? '×' : '⊗';
+          throw new Error(`${sign} does not take a multivector — ⟑ is the geometric product and ∧ the outer product.`);
+        }
+        if (e.glyph === 'wedge') return outerMv(any(e.a), any(e.b));
+        switch (e.op) {
+          case '+':
+          case '-':
+            return mvAdd(any(e.a), any(e.b), e.op === '-');
+          case '*': {
+            // J grade(A, 1): a matrix applies to a multivector that is only a
+            // vector, as J v does — lower() takes both as the values they are.
+            if (!(a && b) && plainValue(a ?? b)) {
+              try {
+                return geometric(any(e.a), any(e.b));
+              } catch {
+                return null;
+              }
+            }
+            return geometric(any(e.a), any(e.b));
+          }
+          case '/': {
+            // Dividing by a multivector is refused, as by a matrix: a/2e_xy
+            // reads as a/(2e_xy), and e_xy⁻¹ = −e_xy would quietly flip it.
+            const d = any(e.b);
+            if (!isScalar(d)) {
+              throw new Error(
+                'Cannot divide by a multivector — multiply by B^-1. (a/2e_xy reads as a/(2e_xy): write a/2 e_xy.)',
+              );
+            }
+            return mvScale(any(e.a), div({ kind: 'num', value: 1 }, d.data[0]));
+          }
+        }
+        return null;
+      }
+      case 'call': {
+        if (e.name === MV_CALL) return mvOfNode(e);
+        const args = e.args;
+        const arity = (n: number, usage: string) => {
+          if (args.length !== n) throw new Error(usage);
+        };
+        switch (e.name) {
+          case 'gp':
+            if (args.length < 2) throw new Error('gp takes two or more multivectors: gp(a, b) is a ⟑ b.');
+            return args.slice(1).reduce((acc, n) => geometric(acc, any(n)), any(args[0]));
+          case 'rev':
+            arity(1, 'rev takes one multivector: rev(R) reverses it, so R p rev(R) turns the point p.');
+            return reverse(any(args[0]));
+          case 'dual':
+            arity(1, 'dual takes one multivector: dual(e_xy) is e_z.');
+            return dual(any(args[0]));
+          case 'conj':
+            // conj of a multivector is its Clifford conjugate; of a number, the complex one.
+            return args.length === 1 && of(args[0]) ? conjugate(of(args[0])!) : null;
+          case 'grade': {
+            arity(2, 'grade takes a multivector and a grade: grade(A, 2) is its bivector part.');
+            return gradePart(any(args[0]), constIndex(args[1], 'A grade'));
+          }
+          case 'vec': {
+            // A quaternion's vector part (x, y, z): the axis it turns about,
+            // scaled by sin(θ/2). For any multivector, the vector of its
+            // bivector part read as a quaternion's (i = e_zy, j = e_xz, k = e_yx).
+            arity(1, 'vec takes one quaternion: vec(quat(w, x, y, z)) is the point (x, y, z).');
+            return vectorMv(quaternionParts(any(args[0])).slice(1));
+          }
+          case 'quat': {
+            // quat(w, x, y, z), or quat(w, v) with v a 3-vector.
+            const vals = args.map(lo);
+            const flat = vals.flatMap(v => (v.vec ? v.items : [v.e]));
+            if (flat.length !== 4 || (vals.length === 2 && (!vals[1].vec || vals[1].items.length !== 3)))
+              throw new Error('quat takes quat(w, x, y, z) — w + x i + y j + z k — or quat(w, v) with v a 3D vector.');
+            return quaternion(flat[0], flat[1], flat[2], flat[3]);
+          }
+          case 'slerp': {
+            arity(3, 'slerp takes two rotors or quaternions and how far along: slerp(q1, q2, u), u from 0 to 1.');
+            const u = lo(args[2]);
+            if (u.vec) throw new Error('slerp goes a number of the way from q1 to q2: slerp(q1, q2, u).');
+            return slerp(any(args[0]), any(args[1]), u.e);
+          }
+          case 'exp': {
+            const a = args.length === 1 ? of(args[0]) : null;
+            return a && mvExp(a);
+          }
+          case 'abs': {
+            const a = args.length === 1 ? of(args[0]) : null;
+            return a && scalarMv({ kind: 'call', name: 'sqrt', args: [normSquared(a)] }, a.dim);
+          }
+        }
+        return null;
+      }
+      default:
+        return null;
+    }
+  })();
+  const value = found && sandwiched(e, found, any);
+  mvSeen.set(e, value);
+  return value;
+}
+
+/**
+ * R p rev(R), for R a rotor or quaternion (or n p rev(n), n a vector): the
+ * point p turned (or reflected), which is a vector. Its trivector part is
+ * zero, but as products that cancel rather than a written 0, so without
+ * this it would not read as a point. Any other product comes back as it is.
+ */
+function sandwiched(e: Expr, m: Multivector, any: (n: Expr) => Multivector): Multivector {
+  const product = (n: Expr): n is Expr & { kind: 'bin' } =>
+    n.kind === 'bin' && n.op === '*' && (!n.glyph || n.glyph === 'geometric');
+  const factors =
+    e.kind === 'call' && e.name === 'gp' && e.args.length === 3
+      ? e.args
+      : product(e) && product(e.a)
+        ? [e.a.a, e.a.b, e.b]
+        : product(e) && product(e.b)
+          ? [e.a, e.b.a, e.b.b]
+          : null;
+  const back = factors?.[2];
+  if (!factors || back?.kind !== 'call' || back.name !== 'rev' || back.args.length !== 1) return m;
+  const r = any(factors[0]);
+  const p = gradesOf(any(factors[1]));
+  const parities = new Set([...gradesOf(r)].map(g => g % 2));
+  const same = (a: Multivector, b: Multivector) => a.dim === b.dim && JSON.stringify(a.data) === JSON.stringify(b.data);
+  if (parities.size !== 1 || [...p].some(g => g !== 1) || !same(r, any(back.args[0]))) return m;
+  return gradePart(m, 1);
+}
+
+/** The calls that make or take points, lines and planes of projective
+ *  geometry (lib/pga.ts). `line` is one only inside another expression: a
+ *  row of its own keeps drawing as the implicit line it always has. */
+const FLAT_FNS = new Set(['meet', 'join', 'plane', 'project', 'reflect', 'line', 'motor', 'rotate', 'slerp', PGA_CALL]);
+
+const MOTOR_USAGE =
+  'motor takes an axis and a turn: motor(L, th, d) turns by th about the line L of space and slides d along it; motor(P, th) turns the plane about the point P.';
+
+const flatMark = new WeakMap<Expr, boolean>();
+function flatIn(e: Expr): boolean {
+  const hit = flatMark.get(e);
+  if (hit !== undefined) return hit;
+  let found = false;
+  switch (e.kind) {
+    case 'call':
+      found = FLAT_FNS.has(e.name) || e.args.some(flatIn);
+      break;
+    case 'bin':
+      found = flatIn(e.a) || flatIn(e.b);
+      break;
+    case 'neg':
+      found = flatIn(e.a);
+      break;
+  }
+  flatMark.set(e, found);
+  return found;
+}
+
+const JOIN_USAGE =
+  'join takes points, or in space a point and a line: join(A, B) is the line through A and B, join(A, B, C) the plane through three points.';
+const MEET_USAGE =
+  'meet takes two lines of the plane, or in space two planes or a line and a plane: meet(L, M) is where they cross.';
+const PLANE_USAGE = 'plane takes three points of space — plane(A, B, C) — or a point and a normal: plane(P, n).';
+
+/** What a flat is called in a message: "a line", "a plane", "a point". */
+const aFlat = (f: Flat): string => `a ${flatName(f.dim, f.grade) ?? 'flat'}`;
+
+/**
+ * A point, line or plane of projective geometry, or null: line(A, B),
+ * plane(…), join, meet, project, reflect and a `[pga]` node written in for
+ * a name. Points enter as the tuples they are (docs/pga.md); arithmetic on
+ * a line or plane is not defined, so only these calls make one.
+ */
+function lowerFlat(e: Expr, lo: (n: Expr) => LV): Flat | null {
+  if (e.kind !== 'call' || !FLAT_FNS.has(e.name)) return null;
+  if (flatSeen.has(e)) return flatSeen.get(e)!;
+  flatSeen.set(e, null);
+  const point = (n: Expr, usage: string): Flat => {
+    const v = lo(n);
+    if (!v.vec || (v.items.length !== 2 && v.items.length !== 3)) throw new Error(usage);
+    return { ...pointPga(v.items), grade: v.items.length };
+  };
+  const arg = (n: Expr, usage: string): Flat => {
+    const f = lowerFlat(n, lo) ?? point(n, usage);
+    if (f.grade === MOTOR)
+      throw new Error(`${usage} A motor moves things rather than being one: rotate(X, M) applies it.`);
+    return f;
+  };
+  const scalar = (n: Expr, usage: string): Expr => {
+    const v = lo(n);
+    if (v.vec) throw new Error(usage);
+    return v.e;
+  };
+  /** A motor argument, or null when the argument is something else. */
+  const motorArg = (n: Expr): Flat | null => {
+    const f = lowerFlat(n, lo);
+    return f?.grade === MOTOR ? f : null;
+  };
+  const sameDim = (fs: Flat[], usage: string) => {
+    if (fs.some(f => f.dim !== fs[0].dim)) throw new Error(`${usage} (One is in the plane and one in space.)`);
+  };
+  const join = (a: Flat, b: Flat): Flat => {
+    const grade = a.grade + b.grade - (a.dim + 1);
+    if (grade < 1) throw new Error(JOIN_USAGE);
+    return { ...regressivePga(a, b), grade };
+  };
+  const found = ((): Flat | null => {
+    const args = e.args;
+    switch (e.name) {
+      case PGA_CALL:
+        return flatOfNode(e)!;
+      case 'line': {
+        const usage = 'line takes two points: line(A, B) is the line through A and B.';
+        // Older links write the coordinates loose, line(0, 0, 1, 2), as a
+        // row of its own still may: they pair into points.
+        const pts = legacyPointArgs(args.map(lo), usage);
+        if (pts.length !== 2 || pts.some(p => p.length !== 2 && p.length !== 3)) throw new Error(usage);
+        const [a, b] = pts.map((p): Flat => ({ ...pointPga(p), grade: p.length }));
+        sameDim([a, b], usage);
+        return join(a, b);
+      }
+      case 'join': {
+        if (args.length !== 2 && args.length !== 3) throw new Error(JOIN_USAGE);
+        const fs = args.map(n => arg(n, JOIN_USAGE));
+        sameDim(fs, JOIN_USAGE);
+        return fs.slice(1).reduce(join, fs[0]);
+      }
+      case 'plane': {
+        if (args.length === 3) {
+          const fs = args.map(n => point(n, PLANE_USAGE));
+          if (fs.some(f => f.dim !== 3)) throw new Error(PLANE_USAGE);
+          return fs.slice(1).reduce(join, fs[0]);
+        }
+        if (args.length !== 2) throw new Error(PLANE_USAGE);
+        const [p, n] = args.map(lo);
+        if (!p.vec || !n.vec || p.items.length !== 3 || n.items.length !== 3) throw new Error(PLANE_USAGE);
+        // n · (X − P) = 0.
+        const offset = neg(p.items.reduce<Expr>((s, c, k) => add(s, mul(c, n.items[k])), { kind: 'num', value: 0 }));
+        return { ...hyperplane(n.items, offset), grade: 1 };
+      }
+      case 'meet': {
+        if (args.length !== 2) throw new Error(MEET_USAGE);
+        const [a, b] = args.map(n => arg(n, MEET_USAGE));
+        sameDim([a, b], MEET_USAGE);
+        if (isPoint(a) || isPoint(b))
+          throw new Error(`${MEET_USAGE} A point meets nothing more: it is already a point.`);
+        const grade = a.grade + b.grade;
+        if (grade > a.dim) {
+          throw new Error(
+            'Two lines in space seldom cross, so meet does not take them — meet a line with a plane, or join(L, P) to span them.',
+          );
+        }
+        return { ...outerPga(a, b), grade };
+      }
+      case 'project':
+      case 'reflect': {
+        const usage =
+          e.name === 'project'
+            ? 'project takes what to project and what onto: project(P, L) is the point of L nearest P.'
+            : 'reflect takes what to reflect and what in: reflect(P, L) mirrors P in the line or plane L, or in a point.';
+        if (args.length !== 2) throw new Error(usage);
+        const [a, b] = args.map(n => arg(n, usage));
+        sameDim([a, b], usage);
+        return { ...(e.name === 'project' ? project(a, b) : reflect(a, b)), grade: a.grade };
+      }
+      case 'motor': {
+        if (args.length !== 2 && args.length !== 3) throw new Error(MOTOR_USAGE);
+        const axis = arg(args[0], MOTOR_USAGE);
+        const fine = axis.dim === 3 ? axis.grade === 2 : isPoint(axis) && args.length === 2;
+        if (!fine) throw new Error(MOTOR_USAGE);
+        const turn = scalar(args[1], MOTOR_USAGE);
+        const slide = args[2] ? scalar(args[2], MOTOR_USAGE) : undefined;
+        return motorPga(axis, turn, slide);
+      }
+      case 'rotate': {
+        // rotate(X, M): a motor moving a point, line or plane — the
+        // sandwich M X M̃. Any other rotate is a turn by an angle or a rotor.
+        const m = args.length === 2 ? motorArg(args[1]) : null;
+        if (!m) return null;
+        const usage = 'rotate(X, M) moves a point, line or plane X by the motor M.';
+        const x = arg(args[0], usage);
+        sameDim([x, m], usage);
+        // A point is moved by the motor's affine map, which stays small.
+        if (isPoint(x)) return { ...pointPga(movePoint(m, pointCoords(x))), grade: x.grade };
+        return { ...moveFlat(m, x), grade: x.grade };
+      }
+      case 'slerp': {
+        // slerp(M1, M2, u): the rigid motion u of the way from one to the other.
+        const [a, b] = args.length === 3 ? args.slice(0, 2).map(motorArg) : [null, null];
+        if (!a && !b) return null;
+        const usage = 'slerp takes two motors and how far along: slerp(M1, M2, u), u from 0 to 1.';
+        if (!a || !b) throw new Error(usage);
+        sameDim([a, b], usage);
+        return slerpMotor(a, b, scalar(args[2], usage));
+      }
+    }
+    return null;
+  })();
+  flatSeen.set(e, found);
+  return found;
+}
+
+/** A flat where a number or a point is wanted: a point is its tuple, and
+ *  a line or plane is refused, saying what to do with it. */
+function flatValue(f: Flat): LV {
+  if (isPoint(f)) return vc(...pointCoords(f));
+  if (f.grade === MOTOR) {
+    throw new Error(
+      'A motor is not a number or a point here — rotate(X, M) moves X by it; or give it a row of its own to draw its axis.',
+    );
+  }
+  throw new Error(
+    `${aFlat(f).replace('a', 'A')} is not a number or a point here — meet(L, M) is where two cross, distance(P, L) how far a point is from one; or give it a row of its own to draw it.`,
+  );
+}
+
+/** distance and angle where a line or plane is involved, or null. */
+function flatMeasure(e: Expr & { kind: 'call' }, lo: (n: Expr) => LV): LV | null {
+  if ((e.name !== 'distance' && e.name !== 'angle') || e.args.length !== 2) return null;
+  const fs = e.args.map(n => lowerFlat(n, lo));
+  if (!fs.some(f => f && !isPoint(f))) return null;
+  const usage =
+    e.name === 'distance'
+      ? 'distance takes two points, lines or planes: distance(P, L).'
+      : 'angle takes three points, two vectors, or two lines or planes: angle(L, M).';
+  const [a, b] = e.args.map((n, k): Flat => {
+    if (fs[k]) return fs[k];
+    const v = lo(n);
+    if (!v.vec || (v.items.length !== 2 && v.items.length !== 3)) throw new Error(usage);
+    return { ...pointPga(v.items), grade: v.items.length };
+  });
+  if (a.dim !== b.dim) throw new Error(`${usage} (One is in the plane and one in space.)`);
+  if (e.name === 'distance') return sc(flatDistance(a, b));
+  if (isPoint(a) || isPoint(b)) throw new Error(usage);
+  return sc(flatAngle(a, b));
+}
+
+/** Any value read as a multivector: a number is grade 0, a point grade 1. */
+function anyMv(n: Expr, lo: (n: Expr) => LV): Multivector {
+  const m = lowerMv(n, lo);
+  if (m) return m;
+  // Inside a multivector, a sum of a number and a vector is one too: in
+  // 1 + e_x + e_xy the 1 + e_x is read before e_xy says what it is.
+  if (n.kind === 'bin' && (n.op === '+' || n.op === '-') && !n.glyph)
+    return mvAdd(anyMv(n.a, lo), anyMv(n.b, lo), n.op === '-');
+  if (n.kind === 'neg') return mvNeg(anyMv(n.a, lo));
+  const v = lo(n);
+  return v.vec ? vectorMv(v.items) : scalarMv(v.e);
+}
+
+/** A multivector where a number or a point is wanted: fine when that is all
+ *  it is written as (e_x ⟑ e_x is 1, grade(A, 1) a vector), an error else. */
+function mvValue(m: Multivector): LV {
+  if (!plainValue(m)) throw new Error(NOT_A_MV_VALUE);
+  if (!gradesOf(m).has(1)) return sc(m.data[0]);
+  return vc(...Array.from({ length: m.dim }, (_, k) => m.data[1 << k]));
+}
+
+/** Whether a multivector — or a side that is none — is only a number or
+ *  only a vector, so mvValue can take it as that. */
+function plainValue(m: Multivector | null): boolean {
+  if (!m) return true;
+  const grades = gradesOf(m);
+  return grades.size === 0 || (grades.size === 1 && (grades.has(0) || grades.has(1)));
+}
+
+/**
+ * A matrix-valued expression — a named matrix, a tuple of rows
+ * `((a, b), (c, d))`, or algebra over them: `s M`, `M / s`, `-M`, `M + N`,
+ * `M N`, `M^n`, `e^M` / `exp(M)`, and the rotation generator `cross(n)` — or
+ * null for anything else.
+ */
+function lowerMat(e: Expr, lo: (n: Expr) => LV, getMat: GetMat): MatValue | null {
+  if (!matsPossible || lowerMv(e, lo)) return null;
+  if (matSeen.has(e)) return matSeen.get(e)!;
+  const of = (n: Expr): MatValue | null => lowerMat(n, lo, getMat);
+  const scalar = (n: Expr, what: string): Expr => {
+    const v = lo(n);
+    if (v.vec) throw new Error(`Cannot ${what} a matrix by a point — M v applies it.`);
+    return v.e;
+  };
+  // ⊗, ∧, contract and tensors of other shapes: a matrix when square. Matrix
+  // algebra reads its own spine first (e^(th J) needs th kept apart), and a
+  // product of tensors it cannot read, (2×3)(3×2), comes back square here.
+  const square = (): MatValue | null => {
+    const t = lowerTensor(e, lo, getMat);
+    const m = t && toMat(t);
+    return m && { m };
+  };
+  const first = tensorOp(e) || e.kind === 'vec' || e.kind === 'var';
+  const found = ((): MatValue | null => {
+    if (first) {
+      const t = lowerTensor(e, lo, getMat);
+      if (t) {
+        const m = toMat(t);
+        return m && { m };
+      }
+    }
+    switch (e.kind) {
+      case 'var': {
+        const m = getMat(e.name);
+        return m && { m };
+      }
+      case 'neg': {
+        const a = of(e.a);
+        return a && matNeg(a);
+      }
+      case 'bin': {
+        if (e.op === '^') {
+          const power = of(e.b);
+          if (power) {
+            if (!isE(e.a)) throw new Error('Only e takes a matrix power: e^(a J) is the rotation by a.');
+            return { m: expOf(power) };
+          }
+          const a = of(e.a);
+          if (!a) return null;
+          const n = e.b.kind === 'neg' && e.b.a.kind === 'num' ? -e.b.a.value : e.b.kind === 'num' ? e.b.value : NaN;
+          return { m: matPow(a.m, n) };
+        }
+        const a = of(e.a);
+        const b = of(e.b);
+        if (!a && !b) return null;
+        switch (e.op) {
+          case '+':
+          case '-':
+            if (!a || !b) {
+              const verb = e.op === '+' ? 'add' : 'subtract';
+              // A point beside a tuple of points moves each of them: the
+              // point is added to every row, wherever T is written, so
+              // `T + p` means one thing on a row, in a definition and in a
+              // figure (docs/multisets.md §9).
+              const p = lo(a ? e.b : e.a);
+              if (p.vec) {
+                const m = (a ?? b)!.m;
+                if (p.items.length !== m[0].length) {
+                  throw new Error(
+                    `Cannot ${verb} a ${p.items.length}D point and a tuple of ${m[0].length}D points — each row takes a point of its own size.`,
+                  );
+                }
+                const op = e.op === '+' ? add : sub;
+                return {
+                  m: m.map(row => row.map((entry, c) => (a ? op(entry, p.items[c]) : op(p.items[c], entry)))),
+                };
+              }
+              throw new Error(`Cannot ${verb} a matrix and a number — use a multiple of the identity.`);
+            }
+            return { m: matAdd(a.m, b.m, e.op === '-') };
+          case '*':
+            if (a && b) return { m: matMul(a.m, b.m) };
+            // M v is a vector, not a matrix: the caller applies it.
+            if (a) {
+              const v = lo(e.b);
+              return v.vec ? null : matScale(a, v.e);
+            }
+            return matScale(b!, scalar(e.a, 'multiply'));
+          case '/':
+            if (!a || b)
+              throw new Error('Cannot divide by a matrix — multiply by M^-1. (a/2J reads as a/(2J): write a/2 J.)');
+            return matScale(a, div({ kind: 'num', value: 1 }, scalar(e.b, 'divide')));
+        }
+        return null;
+      }
+      case 'vec': {
+        // A tuple of rows — ((a, b), (c, d)), or named points (A, B) — is a
+        // matrix when it is square. Anything else is left to lower(), which
+        // says what that tuple is instead.
+        const rows = e.items.map(lo);
+        if (!rows.every(r => r.vec)) return null;
+        const m = matrixFromRows(rows.map(r => (r as LV & { vec: true }).items));
+        return m && { m };
+      }
+      case 'call': {
+        if (e.name === 'exp' && e.args.length === 1) {
+          const a = of(e.args[0]);
+          return a && { m: expOf(a) };
+        }
+        if (e.name === 'transpose' && e.args.length === 1) {
+          const a = of(e.args[0]);
+          if (!a) throw new Error('transpose takes a matrix — define one with M = ((a, b), (c, d)).');
+          return { m: transposeOf(a.m) };
+        }
+        // cross(n, v) with its v left off: the matrix of v ↦ n × v.
+        if (e.name === 'cross' && e.args.length === 1) {
+          const n = lo(e.args[0]);
+          if (!n.vec || n.items.length !== 3)
+            throw new Error('cross(n) is the rotation generator about a 3D axis: e^(a cross((0, 0, 1))) v.');
+          return { m: hatOf(n.items) };
+        }
+        return null;
+      }
+      default:
+        return null;
+    }
+  })();
+  const value = found ?? (first ? null : square());
+  matSeen.set(e, value);
+  return value;
+}
+
+/** sandwichMatrix, built once per rotor: rotate(hull(…), R) turns each
+ *  vertex by the same R, which mvSeen hands back as the same object. */
+const turnSeen = new WeakMap<Multivector, Partial<Record<2 | 3, Expr[][]>>>();
+function turnMatrix(r: Multivector, dim: 2 | 3): Expr[][] {
+  let byDim = turnSeen.get(r);
+  if (!byDim) turnSeen.set(r, (byDim = {}));
+  return (byDim[dim] ??= sandwichMatrix(r, dim));
+}
+
+function lower(e: Expr, getComps: GetComps, getMat: GetMat, isList: IsList): LV {
+  const lo = (n: Expr): LV => lower(n, getComps, getMat, isList);
+  const matOf = (n: Expr): MatValue | null => lowerMat(n, lo, getMat);
+  // A point that projective geometry made is its tuple; a line or plane
+  // only goes where meet, join and the measures take it.
+  if (e.kind === 'call' && flatIn(e)) {
+    const measured = flatMeasure(e, lo);
+    if (measured) return measured;
+    const f = lowerFlat(e, lo);
+    if (f) return flatValue(f);
+  }
+  // A multivector — or a number or vector that one reduces to — first: its
+  // ⟑, ∧ and products are its own, not matrix algebra's.
+  if (e.kind === 'bin' || e.kind === 'neg' || e.kind === 'call') {
+    if (e.kind === 'call' && e.name === 'rotate' && e.args.length === 2) {
+      // rotate(P, R): the sandwich R P R⁻¹, as the matrix it is.
+      const r = lowerMv(e.args[1], lo);
+      if (r) {
+        const p = lo(e.args[0]);
+        if (!p.vec) throw new Error('rotate(P, R) turns a point P by a rotor or quaternion R.');
+        return vc(...matVec(turnMatrix(r, p.items.length as 2 | 3), p.items));
+      }
+    }
+    const m = lowerMv(e, lo);
+    if (m) return mvValue(m);
+  }
+  if (
+    e.kind === 'var' ||
+    e.kind === 'vec' ||
+    e.kind === 'neg' ||
+    e.kind === 'bin' ||
+    e.kind === 'call' ||
+    e.kind === 'index'
+  ) {
+    if (!matsPossible) {
+      if (
+        tensorOp(e) ||
+        deepTuple(e) ||
+        (e.kind === 'var' && tensorNamed(e.name)) ||
+        // T v: a named tuple of points applied as a matrix (see lowerTensor),
+        // and v T, a vector contracted with one.
+        (e.kind === 'bin' &&
+          e.op === '*' &&
+          ((e.a.kind === 'var' && tensorNamed(e.a.name, true)?.shape.length === 2) ||
+            (e.b.kind === 'var' && tensorNamed(e.b.name, true)?.shape.length === 2 && lo(e.a).vec)))
+      )
+        throw new MatrixSeen();
+    } else {
+      // A tensor operation's result is whatever rank it comes to: a number
+      // (contract(M, 1, 2)), a vector (T v), or a tensor, which only a
+      // consumer of tensors — or a row of its own — can take.
+      const t = lowerTensor(e, lo, getMat);
+      if (t) {
+        if (!t.shape.length) return sc(t.data[0]);
+        if (t.shape.length === 1) {
+          return t.data.length === 2 || t.data.length === 3 ? vc(...t.data) : sc({ kind: 'vec', items: [...t.data] });
+        }
+        // (A square one is a matrix, and the matrix paths below say what it may do.)
+        if (!toMat(t)) throw new Error(NOT_A_TENSOR_VALUE(t));
+      }
+    }
+  }
+  switch (e.kind) {
+    case 'index':
+    case 'range':
+    case 'eqtest':
+    case 'figure':
+    case 'lazy':
+    case 'trail':
+    case 'label':
+    case 'hist':
+    case 'family':
+      return sc(
+        mapChildren(e, n => {
+          const v = lo(n);
+          return v.vec ? { kind: 'vec', items: v.items } : v.e;
+        }),
+      );
+    case 'num':
+      return sc(e);
+    case 'var': {
+      if (getMat(e.name)) {
+        if (!matsPossible) throw new MatrixSeen();
+        throw new Error(
+          `${e.name} is a matrix — use ${e.name} v, solve(${e.name}, v), det(${e.name}), or trace(${e.name}).`,
+        );
+      }
+      const comps = getComps(e.name);
+      if (!comps) return sc(e);
+      return vc(...comps.map((name): Expr => ({ kind: 'var', name })));
+    }
+    case 'neg': {
+      if (matOf(e)) throw new Error(NOT_A_VALUE);
+      const a = lo(e.a);
+      if (a.vec) return vc(...a.items.map(neg));
+      return a.e === e.a ? sc(e) : sc({ kind: 'neg', a: a.e });
+    }
+    case 'bin': {
+      // The matvec M v: a matrix name as the direct left factor of a product.
+      if (e.op === '*') {
+        const m = matOf(e.a)?.m;
+        const v = m && !matOf(e.b) ? lo(e.b) : null;
+        if (m && v?.vec) {
+          if (v.items.length !== m.length) {
+            const name = e.a.kind === 'var' ? e.a.name : 'That matrix';
+            throw new Error(
+              `${name} is ${m.length}×${m.length}, so it multiplies a ${m.length}-component vector: ${e.a.kind === 'var' ? e.a.name : 'M'} (x, y${m.length === 3 ? ', z' : ''}).`,
+            );
+          }
+          return vc(...matVec(m, v.items));
+        }
+        if (!m && matOf(e.b) && lo(e.a).vec) {
+          throw new Error(`Matrices multiply on the left — write ${e.b.kind === 'var' ? e.b.name : 'M'} v.`);
+        }
+      }
+      if (matOf(e)) throw new Error(NOT_A_VALUE);
+      const a = lo(e.a);
+      const b = lo(e.b);
+      if (!a.vec && !b.vec) {
+        // Untouched scalar subtrees pass through unchanged, so existing plots
+        // keep their exact GLSL (and shader cache keys).
+        if (a.e === e.a && b.e === e.b) return sc(e);
+        return sc({ kind: 'bin', op: e.op, a: a.e, b: b.e });
+      }
+      switch (e.op) {
+        case '+':
+        case '-':
+          if (a.vec && b.vec) {
+            sameDims(e.op === '+' ? 'add' : 'subtract', a, b);
+            const f = e.op === '+' ? add : sub;
+            return vc(...a.items.map((ai, k) => f(ai, (b as LV & { vec: true }).items[k])));
+          }
+          throw new Error(`Cannot ${e.op === '+' ? 'add' : 'subtract'} a point and a number.`);
+        case '*':
+          if (a.vec && b.vec) {
+            // A · B and A × B, as written; a plain * between points has no one meaning.
+            if (e.glyph) return lower({ kind: 'call', name: e.glyph, args: [e.a, e.b] }, getComps, getMat, isList);
+            throw new Error('Use A · B or A × B (or dot(A, B), cross(A, B)) to multiply points.');
+          }
+          if (a.vec && !b.vec) return vc(...a.items.map(ai => mul(ai, (b as LV & { vec: false }).e)));
+          if (!a.vec && b.vec) return vc(...b.items.map(bi => mul((a as LV & { vec: false }).e, bi)));
+          break;
+        case '/':
+          if (a.vec && !b.vec) return vc(...a.items.map(ai => div(ai, (b as LV & { vec: false }).e)));
+          throw new Error('Cannot divide by a point.');
+        case '^':
+          throw new Error('Cannot raise a point to a power — |A| is its length.');
+      }
+      break;
+    }
+    case 'comp': {
+      // f(P): component k of the one argument, once it is known to be a point.
+      const { value, index: k, arity: n, functionName: fn } = e;
+      let v = compSeen.get(value);
+      // A matrix (a name, or algebra over one: 2 S) has no meaning of its own
+      // to a function of scalars, so it is what it is wherever a call asks
+      // for points — hull(S), distance(S, A): the list of its rows. (A tuple
+      // of 2 points IS a 2×2 matrix; f must not refuse it for that.)
+      const m = !v && ((value.kind === 'var' ? getMat(value.name) : null) ?? matOf(value)?.m);
+      if (m) {
+        if (!compFits(n, k, m.length)) throw new Error(compDims(fn, n, value, m.length));
+        const rows = rowsAsPoints(m, value.kind === 'var' ? value.name : undefined);
+        compSeen.set(value, (v = { wait: rows }));
+      }
+      if (!v) {
+        const listy = (): boolean => listShape(value, getMat, isList) !== null;
+        try {
+          const low = lo(value);
+          v = low.vec || !listy() ? low : { wait: low.e };
+        } catch (err) {
+          // Point-list arithmetic (P + (1, 0), R P) is no point here either:
+          // it is the object expansion's, which finds the list inside.
+          if (err instanceof MatrixSeen || !listy()) throw err;
+          v = { wait: value };
+        }
+        compSeen.set(value, v);
+      }
+      if ('wait' in v) return sc({ ...e, value: v.wait });
+      if (!v.vec) throw new Error(compArity(fn, n));
+      if (!compFits(n, k, v.items.length)) throw new Error(compDims(fn, n, value, v.items.length));
+      return sc(v.items[k]);
+    }
+    case 'call': {
+      if (GEOM_STATEMENTS.has(e.name) || e.name === 'action' || e.name === 'streamlines' || e.name === 'qjulia')
+        throw new Error(`${e.name}(…) must be a whole statement.`);
+      // A function applied per member of lists is list lowering's to run;
+      // the point arithmetic in its body is lowered here, like any other.
+      // (Its arguments too: a list of named points is a list of points.)
+      if (e.name === MAP) {
+        const args = e.args.map((a, i) => {
+          if (i === 0 || (i > 1 && i % 2 === 0)) return a;
+          try {
+            return toExpr(lo(a));
+          } catch (err) {
+            // Point-list arithmetic is the object pass's (lib/object-lists.ts).
+            if (i === 1) throw err;
+            return a;
+          }
+        });
+        return sc(args.every((a, i) => a === e.args[i]) ? e : { ...e, args });
+      }
+      if (e.name === 'trail') {
+        const args = e.args.map(lo);
+        const coords =
+          args.length === 1 && args[0].vec
+            ? args[0].items
+            : args.every(a => !a.vec)
+              ? args.map(a => (a as LV & { vec: false }).e)
+              : [];
+        if (coords.length !== 2 && coords.length !== 3) {
+          throw new Error('trail takes a 2D or 3D point: trail(A) or trail((cos(t), sin(t))).');
+        }
+        return sc({ kind: 'trail', coordinates: coords });
+      }
+      if (e.name === 'label') {
+        // The text comes last; the point before it arrives as one vector
+        // (label(A, …)) or, from a tuple literal, as its spread coordinates.
+        const text = e.args.at(-1);
+        // One text only: an extra string would read as a third coordinate.
+        if (e.args.slice(0, -1).some(a => a.kind === 'str')) {
+          throw new Error('label takes one quoted text, after the point: label((1, 2), "peak").');
+        }
+        const args = e.args.slice(0, -1).map(lo);
+        const coords =
+          args.length === 1 && args[0].vec
+            ? args[0].items
+            : args.every(a => !a.vec)
+              ? args.map(a => (a as LV & { vec: false }).e)
+              : [];
+        if ((coords.length !== 2 && coords.length !== 3) || text?.kind !== 'str') {
+          throw new Error('label takes a point and quoted text: label(A, "vertex") or label((1, 2), "peak").');
+        }
+        return sc({ kind: 'label', coordinates: coords, text: text.value });
+      }
+      if (!matsPossible && e.name === 'cross' && e.args.length === 1) throw new MatrixSeen();
+      if (matOf(e)) throw new Error(NOT_A_VALUE);
+      if (e.name === 'rotate') {
+        // rotate(P, a[, center]) ≡ C + e^(a J) (P − C); rotate(P, a, axis) ≡
+        // e^(a cross(axis/|axis|)) P, and a 3D P with no axis turns about z —
+        // the turn rotate(P, a) makes in the xy-plane. Flattened tuples are
+        // told apart by count.
+        const parts = e.args.map(lo);
+        const flat = parts.flatMap(a => (a.vec ? a.items : [a.e]));
+        if (parts.length === 2 && parts[0].vec && parts[0].items.length === 3 && !parts[1].vec)
+          flat.push({ kind: 'num', value: 0 }, { kind: 'num', value: 0 }, { kind: 'num', value: 1 });
+        if (flat.length === 7) {
+          const axis = flat.slice(4);
+          const turn = expOf(matScale({ m: hatOf(axis) }, div(flat[3], lenOfN(axis))));
+          return vc(...matVec(turn, flat.slice(0, 3)));
+        }
+        if (flat.length !== 3 && flat.length !== 5) throw new Error(ROTATE_USAGE);
+        const num0: Expr = { kind: 'num', value: 0 };
+        const c = flat.length === 5 ? flat.slice(3) : [num0, num0];
+        const turn = expOf(
+          matScale(
+            {
+              m: [
+                [num0, { kind: 'num', value: -1 }],
+                [{ kind: 'num', value: 1 }, num0],
+              ],
+            },
+            flat[2],
+          ),
+        );
+        return vc(...matVec(turn, [sub(flat[0], c[0]), sub(flat[1], c[1])]).map((p, k) => add(c[k], p)));
+      }
+      // A transpose lowered here stands where a number or point goes: matrix
+      // algebra (lowerMat) takes every transpose of a matrix before this.
+      if (e.name === 'transpose') {
+        if (!matsPossible) throw new MatrixSeen();
+        if (e.args.length !== 1 || !matOf(e.args[0])) {
+          throw new Error('transpose takes a matrix — define one with M = ((a, b), (c, d)).');
+        }
+        throw new Error('transpose(M) is a matrix: apply it to a vector, or give it a row of its own to read it.');
+      }
+      if (e.name === 'det' || e.name === 'trace' || e.name === 'solve') {
+        const matArg = (raw: Expr | undefined): ReturnType<GetMat> => {
+          if (!raw) return null;
+          // A matrix — named, a tuple of rows, or algebra over them — is only
+          // read with matrix algebra on: switch it on.
+          if (!matsPossible) throw new MatrixSeen();
+          return matOf(raw)?.m ?? null;
+        };
+        const m = matArg(e.args[0]);
+        if (!m) {
+          throw new Error(`${e.name} takes a matrix — define one with M = ((a, b), (c, d)).`);
+        }
+        if (e.name === 'det' || e.name === 'trace') {
+          if (e.args.length !== 1) throw new Error(`${e.name} takes one matrix.`);
+          return sc(e.name === 'det' ? detOf(m) : traceOf(m));
+        }
+        // solve(M, v): the remaining arguments are the right-hand side — one
+        // vector, or its components flattened out of a tuple literal.
+        const rest = e.args.slice(1).map(lo);
+        let v: Expr[];
+        if (rest.length === 1 && rest[0].vec) v = rest[0].items;
+        else if (rest.length === m.length && rest.every(r => !r.vec)) {
+          v = rest.map(r => (r as LV & { vec: false }).e);
+        } else {
+          throw new Error(`solve takes solve(M, v) with v a ${m.length}-component vector.`);
+        }
+        if (v.length !== m.length) {
+          throw new Error(`${m.length}×${m.length} matrix, ${v.length}-component vector — solve needs them to match.`);
+        }
+        return vc(...solveVec(m, v));
+      }
+      if (e.name === 'distance' || e.name === 'angle') {
+        // Scalars like dot and cross: they work inside any expression, read out
+        // as a bare row, and draw nothing (an arc marker would be its own
+        // wrapper, not a side effect of the readout). Lists inside a component
+        // broadcast later like any scalar's; a list *as* an argument would be
+        // a list of points, which is plan #13's.
+        const usage = e.name === 'distance' ? DISTANCE_USAGE : ANGLE_USAGE;
+        const form = e.name === 'distance' ? 'distance(A, B)' : 'angle(A, B, C)';
+        const listy = `${e.name} takes points, and a list cannot stand for a point yet — ${form}, one point each.`;
+        // The argument left without a partner says what went wrong: a list,
+        // an element of one (a point on its own row, but not yet a point
+        // *value* — P[1] + A fails the same way; plan #13), or a plain number.
+        const stray = (index: number): string => {
+          const shape = listShape(e.args[index], getMat, isList);
+          if (shape === 'list') return listy;
+          if (shape === 'element') {
+            return `${e.name} takes points, and an element of a list cannot stand for a point yet — name the point (Q = (1, 1)) and write ${form}.`;
+          }
+          return usage;
+        };
+        // (A named matrix is a list of rows here, which lowering would reject first.)
+        if (e.args.some(a => a.kind === 'var' && getMat(a.name) !== null)) throw new Error(listy);
+        const args = e.args.map(lo);
+        return sc(e.name === 'distance' ? lowerDistance(args, usage, stray) : lowerAngle(args, usage, stray));
+      }
+      const args = e.args.map(lo);
+      const nPts = Object.hasOwn(POINT_FNS, e.name) ? POINT_FNS[e.name] : undefined;
+      if (nPts !== undefined) {
+        // Vector args of any dim pass straight through; runs of flattened
+        // scalars still pair into 2D points as before.
+        const vs = legacyPointArgs(
+          args,
+          `${e.name} takes points — write ${e.name}(${nPts === 1 ? 'A' : 'A, B'}), with A = (0, 0) defined above.`,
+        );
+        if (vs.length !== nPts) {
+          throw new Error(`${e.name} takes ${nPts} point${nPts === 1 ? '' : 's'}.`);
+        }
+        const dim = vs[0].length;
+        if (vs.some(v => v.length !== dim)) {
+          throw new Error(`${e.name} needs vectors with the same number of components.`);
+        }
+        const twoOnly = () => {
+          if (dim !== 2) throw new Error(`${e.name} is only defined for 2D points.`);
+        };
+        const p = vs[0];
+        const q = vs[1];
+        switch (e.name) {
+          case 'dot': {
+            let s = mul(p[0], q[0]);
+            for (let k = 1; k < dim; k++) s = add(s, mul(p[k], q[k]));
+            return sc(s);
+          }
+          case 'cross':
+            if (dim === 3)
+              return vc(
+                ...p.map((_, k) => sub(mul(p[(k + 1) % 3], q[(k + 2) % 3]), mul(p[(k + 2) % 3], q[(k + 1) % 3]))),
+              );
+            twoOnly();
+            return sc(sub(mul(p[0], q[1]), mul(p[1], q[0])));
+          case 'midpoint':
+            return vc(...p.map((pk, k) => div(add(pk, q[k]), num2)));
+          case 'perp':
+            twoOnly();
+            return vc(neg(p[1]), p[0]);
+          case 'unit':
+            return vc(...p.map(pk => div(pk, lenOfN(p))));
+        }
+      }
+      // |P| is a point's length; |(3, 4)| arrives as abs(3, 4) because the
+      // tuple flattens into the argument list, so a scalar pair re-pairs too.
+      if (e.name === 'abs' && args.length === 1 && args[0].vec) {
+        return sc(lenOfN(args[0].items));
+      }
+      if (e.name === 'abs' && args.length === 2) {
+        const pts = pairPoints('abs', args, 'A');
+        if (pts.length === 1) return sc(lenOfN([pts[0][0], pts[0][1]]));
+      }
+      // sort(P, P.x) orders points by a key; list lowering does the sorting,
+      // and a point stays one value there (docs/multisets.md §3).
+      // count, total and mean take any multiset, points included (§3): a
+      // computed one, 2 [(1, 2), (3, 4)], arrives here as a point of lists.
+      if (e.name === 'sort' || (['count', 'total', 'mean'].includes(e.name) && args.length === 1 && args[0].vec))
+        return sc({ kind: 'call', name: e.name, args: args.map(toExpr) });
+      const flatArgs: Expr[] = [];
+      for (const a of args) {
+        if (a.vec) throw new Error(`${e.name} is not defined for points.`);
+        flatArgs.push(a.e);
+      }
+      if (flatArgs.every((a, k) => a === e.args[k])) return sc(e);
+      return sc({ kind: 'call', name: e.name, args: flatArgs });
+    }
+    case 'eq': {
+      const taken = e.l.kind === 'var' ? TAKEN_NAMES[e.l.name] : undefined;
+      try {
+        const l = lo(e.l);
+        const r = lo(e.r);
+        if (l.vec !== r.vec) throw new Error('One side is a point and the other is a number.');
+        if (!l.vec && l.e === e.l && (r as LV & { vec: false }).e === e.r) return sc(e);
+        return sc({ kind: 'eq', l: toExpr(l), r: toExpr(r) });
+      } catch (err) {
+        // `v = (1, 2, 3)` reads as an equation in v, not a definition.
+        if (!taken || err instanceof MatrixSeen) throw err;
+        const name = (e.l as Expr & { kind: 'var' }).name;
+        throw new Error(`${name} is ${taken}, so it cannot name a value — pick another name, like q.`);
+      }
+    }
+    case 'ineq': {
+      const l = lo(e.l);
+      const r = lo(e.r);
+      if (l.vec || r.vec) throw new Error('Points cannot be compared — compare |A - B| instead.');
+      if (l.e === e.l && r.e === e.r) return sc(e);
+      return sc({ ...e, l: l.e, r: r.e });
+    }
+    case 'vec': {
+      const items = e.items.map(lo);
+      if (items.some(a => a.vec)) {
+        if (items.every(a => a.vec)) {
+          // A tuple of points is a matrix: it is read again with matrix
+          // algebra on, so a consumer — M v, det(M), a definition — sees it
+          // as one. Reaching here with it on, nothing consumed it.
+          if (!matsPossible) throw new MatrixSeen();
+          const square = matOf(e) !== null;
+          const dims = new Set(items.map(a => (a as LV & { vec: true }).items.length));
+          // Not square, so not a matrix here: a tuple of points, which list
+          // lowering keeps in order for polyline(T), T[k] and friends.
+          if (!square && dims.size === 1) return sc({ kind: 'vec', items: items.map(toExpr) });
+          // Two points of one dimension may well have meant the segment.
+          if (e.items.length === 2 && dims.size === 1) {
+            throw new Error(
+              'A pair of points is a 2×2 matrix, not a figure — segment(A, B) joins them, and M (x, y) applies the matrix.',
+            );
+          }
+          throw new Error(square ? NOT_A_VALUE : `A matrix is 2×2 or 3×3 — ${SHAPE_HINT}.`);
+        }
+        throw new Error('A point cannot be a component of a vector.');
+      }
+      const flat = items.map(a => (a as LV & { vec: false }).e);
+      // 2- and 3-vectors become vector values so arithmetic works on both;
+      // toExpr rebuilds the same node shape for anything that reaches root.
+      if (e.items.length === 2 || e.items.length === 3) return vc(...flat);
+      if (flat.every((f, k) => f === e.items[k])) return sc(e);
+      return sc({ kind: 'vec', items: flat });
+    }
+    // Data and text lists hold no geometry: they pass straight through to
+    // list lowering, which is the pass that knows what to do with them.
+    case 'data':
+    case 'str':
+    case 'text':
+      return sc(e);
+    case 'list': {
+      // A list holding a multivector is a multiset of them, read out item
+      // by item: [e_xy, e_x ⟑ e_x] holds e_xy and 1.
+      if (e.items.some(a => !plainValue(lowerMv(a, lo)))) {
+        return sc(sameList(e, { kind: 'list', items: e.items.map(a => mvNode(anyMv(a, lo))) }));
+      }
+      // A list holding lines or planes is a multiset of them (docs/pga.md).
+      const flats = e.items.map(a => (a.kind === 'call' && flatIn(a) ? lowerFlat(a, lo) : null));
+      if (flats.some(f => f && !isPoint(f))) {
+        if (!flats.every(f => f && !isPoint(f) && f.grade === flats[0]?.grade && f.dim === flats[0]?.dim))
+          throw new Error('A list of lines or planes holds only lines, or only planes, of the plane or of space.');
+        return sc(sameList(e, { kind: 'list', items: flats.map(f => flatNode(f!)) }));
+      }
+      // Items lower independently; a named point becomes its (A_x, A_y) vec,
+      // so [A, B] scatters named points like [(1, 2), (3, 4)] does literals.
+      const items = e.items.map(a => toExpr(lo(a)));
+      if (items.every((it, k) => it === e.items[k])) return sc(e);
+      return sc(sameList(e, { kind: 'list', items }));
+    }
+    case 'piecewise': {
+      const one = (n: Expr): Expr => {
+        const v = lo(n);
+        if (v.vec) throw new Error('Points cannot appear in a piecewise expression.');
+        return v.e;
+      };
+      // Point-valued cases are a point of cases, coordinate by coordinate:
+      // {c: (a, b), (p, q)} is ({c: a, p}, {c: b, q}). Where no case holds,
+      // every coordinate is undefined, so the point is.
+      const values = [...e.cases.map(c => lo(c.value)), ...(e.otherwise ? [lo(e.otherwise)] : [])];
+      if (values.some(v => v.vec)) {
+        const n = values[0].vec ? values[0].items.length : 0;
+        if (!values.every(v => v.vec && v.items.length === n))
+          throw new Error('Every case of a piecewise point must be a point of the same dimension.');
+        const conds = e.cases.map(c => one(c.cond));
+        const at = (v: LV, k: number): Expr => (v as LV & { vec: true }).items[k];
+        return vc(
+          ...Array.from({ length: n }, (_, k): Expr => ({
+            kind: 'piecewise',
+            cases: conds.map((cond, j) => ({ cond, value: at(values[j], k) })),
+            otherwise: e.otherwise && at(values[conds.length], k),
+          })),
+        );
+      }
+      // (Every value is a scalar here: `values` already holds them lowered.)
+      const scalar = (v: LV) => (v as LV & { vec: false }).e;
+      const cases = e.cases.map((c, j) => ({ cond: one(c.cond), value: scalar(values[j]) }));
+      const otherwise = e.otherwise && scalar(values[e.cases.length]);
+      if (
+        otherwise === e.otherwise &&
+        cases.every((c, k) => c.cond === e.cases[k].cond && c.value === e.cases[k].value)
+      )
+        return sc(e);
+      return sc({ kind: 'piecewise', cases, otherwise });
+    }
+    case 'loop': {
+      const scalar = (n: Expr): Expr => {
+        const v = lo(n);
+        if (v.vec) throw new Error('Points cannot pass through a recursive function.');
+        return v.e;
+      };
+      // A self-call's points spread into consecutive parameters, as a call's
+      // single point does: f(T(a, b) + P, k + 1) passes f(a, b, k) three
+      // values. A quaternion spreads the same way, into its w, x, y, z, so
+      // an orbit can be written in quaternion algebra: Q(q^2 + c, k + 1).
+      // The function's result and conditions stay numbers.
+      const n = e.params.length;
+      const spread = (a: Expr): Expr[] => {
+        const m = lowerMv(a, lo);
+        if (m) {
+          if (!m.quat) throw new Error(NOT_A_MV_VALUE);
+          return quaternionParts(m);
+        }
+        const v = lo(a);
+        return v.vec ? v.items : [v.e];
+      };
+      const body = (x: Expr): Expr => {
+        if (isRecur(x)) {
+          const args = x.args.flatMap(spread);
+          if (args.length !== n)
+            throw new Error(
+              `A recursive call passes ${args.length} value${args.length === 1 ? '' : 's'}, and the function takes ${n}.`,
+            );
+          return { ...x, args };
+        }
+        if (x.kind !== 'piecewise') return scalar(x);
+        return {
+          ...x,
+          cases: x.cases.map(c => ({ cond: scalar(c.cond), value: body(c.value) })),
+          otherwise: x.otherwise && body(x.otherwise),
+        };
+      };
+      return sc({ ...e, seeds: e.seeds.map(scalar), body: body(e.body) });
+    }
+  }
+  throw new Error('Unreachable');
+}
+
+const num2: Expr = { kind: 'num', value: 2 };
+const VECTOR_USAGE = 'vector takes one or two points: vector(A, B) from A to B, or vector(V) from the origin.';
+const spaceVar = (name: 'x' | 'y'): Expr => ({ kind: 'var', name });
+
+/** Internal figure calls with flat scalar vertices: '[segment]' and
+ *  '[polyline]' are open, '[vector]' is open with an arrowhead at its last
+ *  vertex, '[polygon]' and '[square]' close and fill (otherwise the name only
+ *  differs so classify can word its errors after the statement the user
+ *  wrote). */
+export type FigureName = '[polygon]' | '[segment]' | '[polyline]' | '[vector]' | '[square]' | '[hull]';
+const polyCall = (name: FigureName, pts: Expr[][]): Expr => ({
+  kind: 'figure',
+  form: name.slice(1, -1) as FigureForm,
+  dimension: pts[0].length as 2 | 3,
+  vertices: pts.flat(),
+});
+
+/** A matrix consumed as its rows: a tuple of points, in order (docs/multisets.md
+ *  §3), so polyline(M) walks them and M[2] is the second. Named rows share
+ *  axes across all calls. */
+export function rowsAsPoints(matrix: Mat, name?: string): Expr & { kind: 'list' } {
+  const rows: Expr & { kind: 'list' } = { kind: 'list', items: matrix.map(items => ({ kind: 'vec', items })) };
+  return withAxes(rows, name ? [{ id: `${name}#0`, n: matrix.length, ordered: true }] : [tupleAxis(matrix.length)]);
+}
+
+/** A definition whose value is a matrix (`R = e^(a J)`, `N = 2 M`), or null. */
+export function lowerMatrix(
+  e: Expr,
+  getComps: GetComps,
+  getMat: GetMat,
+  getTensor: GetTensor = () => null,
+  isList: IsList = () => false,
+): Mat | null {
+  // Only the matrix-algebra spine can make a matrix: look along it for one.
+  const spine = (n: Expr): boolean => {
+    if (tensorOp(n)) return true;
+    switch (n.kind) {
+      case 'var':
+        return getMat(n.name) !== null || getTensor(n.name) !== null;
+      // T[2], a slice of a tensor.
+      case 'index':
+        return n.args[0].kind !== 'var' || getTensor(n.args[0].name) !== null ? spine(n.args[0]) : false;
+      // A tuple with a row in it: ((a, b), (c, d)), or named points (A, B).
+      case 'vec':
+        return (
+          (n.items.length === 2 || n.items.length === 3) &&
+          n.items.some(it => it.kind === 'vec' || (it.kind === 'var' && getComps(it.name) !== null))
+        );
+      case 'neg':
+        return spine(n.a);
+      case 'bin':
+        return spine(n.a) || spine(n.b);
+      case 'call':
+        return (
+          (n.name === 'cross' && n.args.length === 1) ||
+          ((n.name === 'exp' || n.name === 'transpose') && n.args.length === 1 && spine(n.args[0]))
+        );
+      default:
+        return false;
+    }
+  };
+  if (!spine(e)) return null;
+  fresh(getTensor, isList, true);
+  return lowerMat(e, n => lower(n, getComps, getMat, isList), getMat)?.m ?? null;
+}
+
+/** A definition whose value is a tensor of any shape but a square matrix's
+ *  (`T = e_x ⊗ e_y ⊗ e_z`, `R = ((1, 2, 3, 4), (5, 6, 7, 8))`), or null.
+ *  (A square one is lowerMatrix's; a tuple of points stays a tuple.) */
+export function lowerTensorValue(
+  e: Expr,
+  getComps: GetComps,
+  getMat: GetMat,
+  getTensor: GetTensor,
+  isList: IsList = () => false,
+): Tensor | null {
+  if (
+    !tensorOp(e) &&
+    !deepTuple(e) &&
+    !(e.kind === 'var' && getTensor(e.name)) &&
+    e.kind !== 'bin' &&
+    e.kind !== 'neg' &&
+    e.kind !== 'index'
+  )
+    return null;
+  fresh(getTensor, isList, true);
+  const t = lowerTensor(e, n => lower(n, getComps, getMat, isList), getMat);
+  // (Not square with rows of 2 or 3 is a tuple of points, named as one.)
+  const points = t?.shape.length === 2 && (t.shape[1] === 2 || t.shape[1] === 3);
+  return t && t.shape.length >= 2 && !toMat(t) && !points ? t : null;
+}
+
+/** The internal call streamlines(M) lowers to, around the lowered matrix. */
+export const STREAMLINES_CALL = '[streamlines]';
+/** `[paint](S, f)`: the surface S coloured by f, a scalar in the same u and
+ *  v — gaussian(S) alone on a row (lib/analysis.ts), which classify unwraps
+ *  (lib/plot.ts paintedSurface). */
+export const PAINT_CALL = '[paint]';
+export const STREAMLINES_USAGE =
+  'streamlines takes one 2×2 matrix in x and y — streamlines(((x, y), (y, -x))) traces its major eigenvector.';
+
+/** Lower a whole statement: desugar a root-level geometry form, expand all
+ *  point arithmetic, and return an expression classify already understands. */
+export function lowerGeom(
+  e: Expr,
+  getComps: GetComps,
+  getMat: GetMat = () => null,
+  isList: IsList = () => false,
+  getTensor: GetTensor = () => null,
+): Expr {
+  return withMatrices(getTensor, isList, () => lowerStatement(e, getComps, getMat, isList));
+}
+
+/**
+ * `L = line(A, B)`: the line as the value it is (lib/pga.ts), which a
+ * definition names — where a row of its own draws line(A, B) as the
+ * implicit line it always has. Null for anything else.
+ */
+export function lowerLineValue(
+  e: Expr,
+  getComps: GetComps,
+  getMat: GetMat = () => null,
+  isList: IsList = () => false,
+  getTensor: GetTensor = () => null,
+): Expr | null {
+  if (e.kind !== 'call' || e.name !== 'line') return null;
+  return withMatrices(getTensor, isList, () => {
+    const f = lowerFlat(e, n => lower(n, getComps, getMat, isList));
+    return f && flatNode(f);
+  });
+}
+
+function lowerStatement(e: Expr, getComps: GetComps, getMat: GetMat, isList: IsList): Expr {
+  // qjulia(c[, s]): the quaternion Julia set of c, sliced at k = s.
+  if (e.kind === 'call' && e.name === 'qjulia') {
+    const usage =
+      'qjulia takes a quaternion and, optionally, the slice to cut: qjulia(quat(-0.2, 0.8, 0, 0)) or qjulia(c, s).';
+    if (e.args.length !== 1 && e.args.length !== 2) throw new Error(usage);
+    const lo = (n: Expr): LV => lower(n, getComps, getMat, isList);
+    const c = lowerMv(e.args[0], lo);
+    if (!c) throw new Error(usage);
+    const slice = e.args[1] ? lo(e.args[1]) : sc({ kind: 'num', value: 0 });
+    if (slice.vec) throw new Error(usage);
+    return juliaSurface(quaternionParts(c), slice.e);
+  }
+  // streamlines(M): a matrix field drawn along its major eigenvector rather
+  // than as glyphs. The matrix lowers as a row of its own would, inside a
+  // marker classify unwraps (lib/plot.ts).
+  if (e.kind === 'call' && e.name === 'streamlines') {
+    if (e.args.length !== 1) throw new Error(STREAMLINES_USAGE);
+    return { kind: 'call', name: STREAMLINES_CALL, args: [lowerStatement(e.args[0], getComps, getMat, isList)] };
+  }
+  if (e.kind === 'call' && e.name === PAINT_CALL) {
+    const lo = (n: Expr): Expr => toExpr(lower(n, getComps, getMat, isList));
+    return { kind: 'call', name: PAINT_CALL, args: e.args.map(lo) };
+  }
+  // action(M): the matrix drawn by what it does (lib/glyphs.ts).
+  if (e.kind === 'call' && e.name === 'action') {
+    if (!matsPossible) throw new MatrixSeen();
+    const usage =
+      'action takes one 2×2 or 3×3 matrix — action(((1, 1), (0, 1))) draws where it sends the unit square, circle and axes.';
+    if (e.args.length !== 1) throw new Error(usage);
+    const m = lowerMat(e.args[0], n => lower(n, getComps, getMat, isList), getMat)?.m;
+    if (!m) throw new Error(usage);
+    return actionNode(m);
+  }
+  // A point, line or plane on a row of its own draws, and reads out what it
+  // is (docs/pga.md). line(A, B) of the plane stays the implicit line below.
+  if (e.kind === 'call' && e.name !== 'line' && flatIn(e)) {
+    const f = lowerFlat(e, n => lower(n, getComps, getMat, isList));
+    if (f) return flatNode(f);
+  }
+  // A multivector on a row of its own draws by grade (docs/clifford.md); one
+  // that is only a number or a vector lowers as that number or vector. A
+  // quaternion stays one, so q1 = quat(1, 0, 0, 0) still turns rotate(P, q1).
+  if (mvIn(e)) {
+    const m = lowerMv(e, n => lower(n, getComps, getMat, isList));
+    if (m) {
+      const grades = gradesOf(m);
+      if (m.quat || grades.size > 1 || [...grades].some(g => g >= 2)) return mvNode(m);
+    }
+  }
+  // A matrix or tensor with nothing to act on is drawn as its values
+  // (docs/multisets.md §5): it has no position, so its row reads it out.
+  // A pair of named points keeps saying what it is not: it was most likely
+  // meant as the segment, which a readout of the matrix would not suggest.
+  const namedPair = e.kind === 'vec' && e.items.length === 2 && e.items.every(it => it.kind === 'var');
+  if (matsPossible && !namedPair) {
+    const lo = (n: Expr): LV => lower(n, getComps, getMat, isList);
+    const t = lowerTensor(e, lo, getMat);
+    let m: MatValue | null = null;
+    try {
+      m = t ? null : lowerMat(e, lo, getMat);
+    } catch {
+      // Not a matrix after all ((1, 2) M): lowering below says what it is.
+    }
+    const value = t ?? (m && fromMat(m.m));
+    // A 3×2 tensor is a tuple of 2D points however it was made, so it draws
+    // as ((1, 1), (2, 2), (3, 3)) written out does: as dots.
+    if (value?.shape.length === 2 && !toMat(value) && (value.shape[1] === 2 || value.shape[1] === 3)) {
+      return { kind: 'vec', items: rows(value).map((r): Expr => ({ kind: 'vec', items: [...r.data] })) };
+    }
+    if (value && value.shape.length >= 2) return tensorNode(value);
+  }
+  if (e.kind === 'call' && GEOM_STATEMENTS.has(e.name)) {
+    // A list of points — literal, named, or a named matrix read as its rows —
+    // is plan #13's; until then say so rather than "takes points".
+    if ((e.name === 'polyline' || e.name === 'vector') && e.args.some(a => isListArg(a, getMat, isList))) {
+      throw new Error(
+        `${e.name} takes its points one by one for now — ${e.name === 'polyline' ? 'polyline(A, B, C)' : 'vector(A, B)'} — not as a list.`,
+      );
+    }
+    const args = e.args.map(a => lower(a, getComps, getMat, isList));
+    if (e.name === 'circle') {
+      // circle(C, r): the trailing argument is the scalar radius.
+      const r = args[args.length - 1];
+      if (args.length < 2 || !r || r.vec) throw new Error('circle takes circle(center, radius).');
+      const pts = pairPoints('circle', args.slice(0, -1), 'center, radius');
+      if (pts.length !== 1) throw new Error('circle takes circle(center, radius).');
+      const [cx, cy] = pts[0];
+      return {
+        kind: 'eq',
+        l: add(sq(sub(spaceVar('x'), cx)), sq(sub(spaceVar('y'), cy))),
+        r: sq(r.e),
+      };
+    }
+    // Tuple literals arrive flattened, so (1, 2, 3) cannot be told from
+    // (1, 2), 3: an odd run of scalars gets the one message true of both.
+    if (e.name === 'vector' && args.every(a => !a.vec) && args.length % 2 === 1) throw new Error(VECTOR_USAGE);
+    const pts = legacyPointArgs(args, `${e.name} takes points with matching dimensions.`);
+    if (!pts.length || ![2, 3].includes(pts[0].length) || pts.some(p => p.length !== pts[0].length))
+      throw new Error(`${e.name} needs points with matching dimensions.`);
+    if (pts[0].length === 3 && e.name === 'line' && pts.length === 2) {
+      // A line of space is a value of projective geometry (lib/pga.ts).
+      return flatNode({ ...regressivePga(pointPga(pts[0]), pointPga(pts[1])), grade: 2 });
+    }
+    if (pts[0].length === 3 && (e.name === 'line' || e.name === 'square'))
+      throw new Error(`${e.name} is only defined for 2D points.`);
+    if (e.name === 'line') {
+      if (pts.length !== 2) {
+        throw new Error('line takes two points: line(A, B), with A = (0, 0) defined above.');
+      }
+      // The infinite line through A and B: cross(P - A, B - A) = 0, an
+      // ordinary implicit equation (so it renders on the GPU like any curve).
+      const [[ax, ay], [bx, by]] = pts;
+      return {
+        kind: 'eq',
+        l: sub(mul(sub(spaceVar('x'), ax), sub(by, ay)), mul(sub(spaceVar('y'), ay), sub(bx, ax))),
+        r: { kind: 'num', value: 0 },
+      };
+    }
+    if (e.name === 'segment') {
+      if (pts.length !== 2) {
+        throw new Error('segment takes two points: segment(A, B), with A = (0, 0) defined above.');
+      }
+      return polyCall('[segment]', pts);
+    }
+    if (e.name === 'hull') {
+      // The convex hull: a filled polygon in the plane, a solid in space.
+      // Which vertices are extreme is settled per frame, from their values.
+      if (pts.length < 3)
+        throw new Error('hull needs at least 3 points: hull(A, B, C, D), or hull(P) for a list of points.');
+      return polyCall('[hull]', pts);
+    }
+    if (e.name === 'polyline') {
+      if (pts.length < 2) throw new Error('polyline needs at least 2 points: polyline(A, B, C).');
+      return polyCall('[polyline]', pts);
+    }
+    if (e.name === 'vector') {
+      // vector(A, B) is the arrow from A to B; vector(V) starts at the origin.
+      if (pts.length !== 1 && pts.length !== 2) throw new Error(VECTOR_USAGE);
+      const zero: Expr = { kind: 'num', value: 0 };
+      return polyCall('[vector]', pts.length === 1 ? [pts[0].map(() => zero), pts[0]] : pts);
+    }
+    if (e.name === 'square') {
+      if (pts.length !== 2) throw new Error('square takes two points: square(A, B).');
+      // The square erected on side A→B, on the left of the direction A→B.
+      const [[ax, ay], [bx, by]] = pts;
+      const px = neg(sub(by, ay)); // perp(B - A)
+      const py = sub(bx, ax);
+      return polyCall('[square]', [
+        [ax, ay],
+        [bx, by],
+        [add(bx, px), add(by, py)],
+        [add(ax, px), add(ay, py)],
+      ]);
+    }
+    if (pts.length < 3) throw new Error('polygon needs at least 3 vertices.');
+    return polyCall('[polygon]', pts);
+  }
+  return toExpr(lower(e, getComps, getMat, isList));
+}
+
+/**
+ * The head of an arrow whose shaft runs (x0, y0) → (x1, y1) in screen pixels:
+ * the triangle tip/left/right with its tip at (x1, y1), plus shaftEnd, where
+ * the stroke should stop instead of at the tip — a little inside the head, so
+ * its blunt end never pokes through the point and no seam opens at the base.
+ * `size` is the head length in pixels — fixed on screen, so the head does not
+ * scale with zoom — shrinking only when the shaft itself is shorter. Null for
+ * a zero-length (or non-finite) shaft, which has no direction. Shared by
+ * render2d and the og rasterizer so both draw the same arrow.
+ */
+export interface ArrowHead {
+  tip: [number, number];
+  left: [number, number];
+  right: [number, number];
+  shaftEnd: [number, number];
+}
+export function arrowHead(x0: number, y0: number, x1: number, y1: number, size: number): ArrowHead | null {
+  const len = Math.hypot(x1 - x0, y1 - y0);
+  if (!(len > 0) || !Number.isFinite(len)) return null;
+  const ux = (x1 - x0) / len,
+    uy = (y1 - y0) / len;
+  const h = Math.min(size, len);
+  const w = h * 0.4; // half-width: a 2.5:2 head, slim enough to read as a direction
+  const bx = x1 - ux * h,
+    by = y1 - uy * h;
+  return {
+    tip: [x1, y1],
+    left: [bx - uy * w, by + ux * w],
+    right: [bx + uy * w, by - ux * w],
+    shaftEnd: [bx + ux * h * 0.25, by + uy * h * 0.25],
+  };
+}

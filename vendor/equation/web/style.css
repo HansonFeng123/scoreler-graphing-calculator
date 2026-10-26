@@ -1,0 +1,1265 @@
+@import './math-glyphs.css';
+
+* {
+  box-sizing: border-box;
+}
+
+/* The graph owns every gesture: one finger pans it, two pinch it (see the
+   pointer handlers in main.ts), so no touch should reach the viewport's own
+   pan/zoom — an accidental page zoom has no way back short of a reload.
+   Blanket rather than per-element so a pinch that happens to start on the
+   equation text can't leak through; `pan-x pan-y` rather than `none` leaves
+   the caret, text selection, and the panel's internal scrolling alone. */
+* {
+  touch-action: pan-x pan-y;
+}
+
+/* The page is an app, not a document: chrome, buttons and the graph never
+   select (no blue sweep on select-all, no long-press selection on labels).
+   Only real text surfaces opt back in — the equation editor and the slider
+   bound fields below. Inherited, so those two opt-ins cover their subtrees. */
+body {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Light theme (default). The dark overrides live in [data-theme="dark"] below;
+   the JS theme switch flips data-theme on <html>, so every panel color moves
+   with the WebGL background in one place. */
+:root {
+  --safe-area-top: env(safe-area-inset-top);
+  --safe-area-right: env(safe-area-inset-right);
+  --safe-area-bottom: env(safe-area-inset-bottom);
+  --safe-area-left: env(safe-area-inset-left);
+  --panel-bottom-inset: var(--safe-area-bottom);
+  --page-bg: #fff;
+  --panel-bg: rgba(255, 255, 255, 0.92);
+  --panel-border: rgba(0, 0, 0, 0.1);
+  --panel-shadow: rgba(0, 0, 0, 0.12);
+  --text: #222;
+  --dot-border: rgba(0, 0, 0, 0.15);
+  --eq-focus: rgba(0, 90, 200, 0.05);
+  --row-focus: rgba(20, 30, 50, 0.06);
+  --error-line: #d33;
+  --error: #c0392b;
+  --info: #557;
+  --placeholder: #aaa;
+  --accent: #2d70b3;
+  --bound: #999;
+  --bound-focus: #333;
+  --divider: rgba(0, 0, 0, 0.06);
+  --muted: #888;
+  --muted-hover: #444;
+  --summary: #555;
+  --summary-hover: #000;
+  --ex-text: #333;
+  --ex-hover-bg: rgba(0, 90, 200, 0.08);
+  --ex-code: #999;
+  --ex-code-hover: #667;
+  --syn-base: #555;
+  --syn-num: #8a5a2e;
+  --syn-str: #6b6540;
+  --syn-fn: #3d6390;
+  --syn-name: #111;
+  --syn-unbound: #9a9a9a;
+}
+
+:root[data-theme='dark'] {
+  --page-bg: #171a1f;
+  --panel-bg: rgba(24, 27, 33, 0.92);
+  --panel-border: rgba(255, 255, 255, 0.12);
+  --panel-shadow: rgba(0, 0, 0, 0.5);
+  --text: #e6e8ea;
+  --dot-border: rgba(255, 255, 255, 0.22);
+  --eq-focus: rgba(90, 150, 255, 0.14);
+  --row-focus: rgba(0, 0, 0, 0.32);
+  --error-line: #f0575c;
+  --error: #f0797d;
+  --info: #97a3b8;
+  --placeholder: #5f6672;
+  --accent: #5a9bf0;
+  --bound: #767c88;
+  --bound-focus: #cfd3da;
+  --divider: rgba(255, 255, 255, 0.08);
+  --muted: #868d99;
+  --muted-hover: #c3c8d0;
+  --summary: #a8aeba;
+  --summary-hover: #fff;
+  --ex-text: #cfd3da;
+  --ex-hover-bg: rgba(90, 150, 255, 0.14);
+  --ex-code: #767c88;
+  --ex-code-hover: #97a3b8;
+  --syn-base: #aeb4be;
+  --syn-num: #cfae88;
+  --syn-str: #bdb48c;
+  --syn-fn: #9db6d8;
+  --syn-name: #f4f5f7;
+  --syn-unbound: #767c88;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--page-bg);
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+}
+#gl,
+#overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  /* Installed on iOS with a translucent status bar, WebKit shortens the
+     viewport by the status bar height but still lays the page out from the top
+     of the screen, stranding a dead band above the home indicator (measured:
+     402x874 screen, 402x812 viewport, 62px top inset). Add the inset back so
+     the canvas reaches the bottom edge. Everywhere else the inset is 0 and this
+     is plain 100%. */
+  height: calc(100% + env(safe-area-inset-top));
+}
+#gl {
+  touch-action: none;
+}
+#overlay {
+  pointer-events: none;
+}
+
+#tooltip {
+  position: fixed;
+  display: none;
+  pointer-events: none;
+  background: var(--panel-bg);
+  color: var(--text);
+  border: 1.5px solid var(--muted);
+  border-radius: 3px;
+  box-shadow: 0 2px 10px var(--panel-shadow);
+  padding: 5px 9px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  z-index: 20;
+}
+#tooltip .tip-head {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+#panel.is-parked {
+  visibility: hidden;
+}
+
+#panel {
+  position: absolute;
+  /* viewport-fit=cover lets the canvas fill the whole screen (under the iOS
+     status bar and home indicator); keep the controls inside the safe area. */
+  top: calc(12px + var(--safe-area-top));
+  left: calc(12px + var(--safe-area-left));
+  width: 300px;
+  /* Tighter than the blanket pan-x pan-y: nothing in the panel scrolls
+     sideways, so declaring pan-y keeps horizontal touchmoves cancelable and
+     the swipe-to-dismiss drag (panel-swipe.ts) can claim them. Vertical
+     panning stays native for #equations scrolling. */
+  touch-action: pan-y;
+  /* Keep the panel on screen with many equations: cap it at the viewport
+     (12px margin top and bottom) and let #equations scroll inside. */
+  max-height: calc(100% - 24px - var(--panel-bottom-inset));
+  /* A remembered width (panel-resize.ts) from a wider screen re-clamps here. */
+  max-width: calc(100% - 24px - var(--safe-area-left) - var(--safe-area-right));
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-bg);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  box-shadow: 0 4px 20px var(--panel-shadow);
+  /* Extra top room for the grip strip. */
+  padding: 16px 8px 8px;
+  z-index: 5;
+}
+
+/* Corner pinning (panel-swipe.ts): flicking the panel re-anchors it via
+   these classes rather than a transform, so a bottom-pinned panel grows
+   upward as equations are added and rotations keep it glued to its corner. */
+#panel.pin-right {
+  left: auto;
+  right: calc(12px + var(--safe-area-right));
+}
+#panel.pin-bottom {
+  top: auto;
+  bottom: calc(12px + var(--panel-bottom-inset));
+  max-height: calc(100% - 24px - var(--safe-area-top));
+}
+
+/* The drag handle: a strip along the panel's top edge (under the corner
+   buttons) drawn as an iOS-sheet grabber pill. Touches can drag the panel
+   from anywhere, but for a mouse this is the one drag surface — anywhere
+   else a mouse drag means text selection. */
+#panel-grip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 16px;
+  z-index: 1;
+  cursor: grab;
+  /* No browser pan may start on the handle, so its touchmoves stay
+     cancelable and a drag claims instantly — even mid-edit, when the text
+     below cedes to caret and selection gestures. */
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+#panel-grip:active {
+  cursor: grabbing;
+}
+#panel-grip::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  width: 36px;
+  height: 4px;
+  margin-left: -18px;
+  border-radius: 2px;
+  background: var(--panel-border);
+}
+#panel-grip:hover::after {
+  background: var(--muted);
+}
+
+/* The resize strip (panel-resize.ts): straddles the panel's outer vertical
+   edge — the one away from the pinned corner — below the grip. A grabber
+   pill like the grip's appears on hover; the strip itself stays invisible. */
+#panel-resize {
+  position: absolute;
+  top: 16px;
+  bottom: 0;
+  right: -5px;
+  width: 10px;
+  z-index: 1;
+  cursor: ew-resize;
+  /* No browser pan may start on the strip: its pointermoves keep arriving
+     for the whole drag, same deal as the grip. */
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+#panel.pin-right #panel-resize {
+  right: auto;
+  left: -5px;
+}
+#panel-resize::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 36px;
+  margin: -18px 0 0 -2px;
+  border-radius: 2px;
+}
+#panel-resize:hover::after,
+#panel-resize:active::after {
+  background: var(--panel-border);
+}
+/* Keyboard focus shows the pill in the accent color instead of the default
+   outline, which would trace the whole off-edge strip. */
+#panel-resize {
+  outline: none;
+}
+#panel-resize:focus-visible::after {
+  background: var(--accent);
+}
+
+#theme-toggle,
+#state-reset,
+#shot,
+#rec {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 24px;
+  text-align: center;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+#shot {
+  right: 34px;
+}
+#rec {
+  right: 62px;
+}
+/* Only present while a row defines a state (`a' = …`). */
+#state-reset {
+  right: 90px;
+  font-size: 14px;
+}
+#rec[hidden] ~ #state-reset {
+  right: 62px;
+}
+#state-reset[hidden] {
+  display: none;
+}
+#rec[hidden] {
+  display: none;
+}
+#rec.recording {
+  color: #e24;
+}
+#rec .rec-stop {
+  display: none;
+}
+#rec.recording .rec-dot {
+  display: none;
+}
+#rec.recording .rec-stop {
+  display: block;
+}
+#theme-toggle:hover,
+#state-reset:hover,
+#shot:hover,
+#rec:hover {
+  background: var(--eq-focus);
+  color: var(--muted-hover);
+}
+#rec.recording:hover {
+  color: #c12;
+}
+
+#equations {
+  /* Scrolls when the list outgrows the panel's max-height. `none` (not
+     `contain`) so a scroll that hits the end neither chains into a page
+     bounce nor bounces the list itself — at the edge the browser lets go of
+     the touch, which is what hands "keep swiping past the end" to the
+     panel-dismiss gesture (panel-swipe.ts), the way iOS sheets take over
+     from their scroll views. */
+  overflow-y: auto;
+  min-height: 0;
+  flex: 0 1 auto;
+  overscroll-behavior: none;
+  outline: none;
+  color: var(--text);
+  font:
+    15px/1.5 'Eq Math Glyphs',
+    ui-monospace,
+    'SF Mono',
+    Menlo,
+    monospace;
+  padding: 2px 0;
+  caret-color: var(--text);
+  /* Opt back out of the body's user-select: none — explicitly, because on
+     iOS a non-selectable ancestor otherwise leaves the editable untappable. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+.eq-line {
+  position: relative;
+  padding: 4px 6px 4px 28px;
+  margin: 1px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 1.5em;
+}
+.eq-line::before {
+  /* color bar down the row's left edge; clicks in the left gutter (the
+     first 22px, main.ts gutterHit) cycle the color */
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  background: var(--eq-color, #ccc);
+  cursor: pointer;
+  transition: width 0.12s;
+}
+.eq-line.is-def::before {
+  visibility: hidden;
+}
+/* A `---` row splits the graph into panels (lib/panels.ts): it reads as a rule. */
+.eq-line.is-divider {
+  color: var(--muted);
+  border-top: 1px solid var(--placeholder);
+}
+/* A trailing `# note` (lib/statements.ts noteStart) reads as a caption: on
+   its own line under the math, in a smaller prose face. */
+.eq-note {
+  display: block;
+  color: var(--muted);
+  font:
+    12.5px/1.45 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+}
+/* `# label` comment rows head a collapsible group; the gutter chevron
+   (replacing the color dot) toggles it. */
+.eq-line.is-comment {
+  color: var(--muted);
+  font-weight: 600;
+}
+.eq-line.is-comment::before {
+  content: '▸';
+  background: none;
+  left: 6px;
+  top: 4px;
+  bottom: auto;
+  width: 14px;
+  height: auto;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 22px;
+  text-align: center;
+  transform: rotate(90deg);
+  transition: transform 0.12s;
+}
+.eq-line.is-comment.collapsed::before {
+  transform: none;
+}
+.eq-line.is-comment.collapsed::after {
+  content: attr(data-hidden);
+  margin-left: 10px;
+  color: var(--placeholder);
+  font:
+    11px ui-sans-serif,
+    system-ui,
+    sans-serif;
+}
+/* Syntax colour (web/highlight.ts): highlight ranges over the row text, so
+   the editable DOM stays plain text. Quiet on purpose — hue already means
+   "this row is that curve" in the colour bars — so punctuation sits back,
+   names that resolve read brightest, names nothing binds yet go grey, and
+   only numbers and functions carry a faint tint. */
+#equations .eq-line:not(.is-comment, .is-divider, .is-view) {
+  color: var(--syn-base);
+}
+::highlight(eq-num),
+::highlight(eq-const) {
+  color: var(--syn-num);
+}
+::highlight(eq-str) {
+  color: var(--syn-str);
+}
+::highlight(eq-fn) {
+  color: var(--syn-fn);
+}
+::highlight(eq-coord),
+::highlight(eq-name) {
+  color: var(--syn-name);
+}
+::highlight(eq-unbound) {
+  color: var(--syn-unbound);
+}
+/* A viewport row is written by panning: state, not math, so it recedes. */
+#equations .eq-line.is-view {
+  color: var(--muted);
+}
+::highlight(eq-link) {
+  text-decoration: underline;
+}
+#equations.eq-linking {
+  cursor: pointer;
+}
+/* A row just jumped to by ⌘-click on one of its names. */
+.eq-line.eq-flash {
+  animation: eq-flash 0.9s ease-out;
+}
+@keyframes eq-flash {
+  from {
+    background: var(--ex-hover-bg);
+  }
+}
+/* What a hovered name is: signature, type, and where it is defined. */
+#eq-hover {
+  position: fixed;
+  z-index: 100;
+  max-width: 340px;
+  pointer-events: none;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--page-bg);
+  color: var(--text);
+  box-shadow: 0 5px 24px var(--panel-shadow);
+  padding: 7px 10px;
+  font:
+    12px/1.45 system-ui,
+    sans-serif;
+  overflow-wrap: anywhere;
+}
+#eq-hover[hidden] {
+  display: none;
+}
+#eq-hover code {
+  font:
+    13px 'Eq Math Glyphs',
+    ui-monospace,
+    monospace;
+}
+.eq-hover-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.eq-hover-type {
+  color: var(--syn-fn);
+  font-size: 11px;
+  white-space: nowrap;
+}
+#eq-hover code.eq-hover-def {
+  display: block;
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--divider);
+  color: var(--summary);
+  font-size: 12px;
+}
+.eq-hover-key {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+/* Rows inside a collapsed group; they stay in the DOM (copy/undo/share). */
+#equations .eq-hidden {
+  display: none;
+}
+.eq-line.focused:not(.is-comment)::before {
+  width: 7px;
+}
+.eq-line.invalid {
+  box-shadow: inset 0 -1px var(--error-line);
+}
+.eq-line[data-ph]::after {
+  /* Overlay the empty line: in-flow it would land after the line's <br>,
+     rendering on a second visual line and doubling the row height. */
+  content: attr(data-ph);
+  position: absolute;
+  left: 28px;
+  top: 4px;
+  color: var(--placeholder);
+  pointer-events: none;
+}
+.eq-widget {
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* A sweep across the rows selects only equation text: copy/cut already skip
+   widgets (main.ts selectionAsText), so don't paint them as selected either —
+   not the slider, nor its bound fields, which opt back into user-select. A
+   bound's own selection, made while editing it, still shows. */
+.eq-widget::selection,
+.eq-widget *::selection {
+  background: transparent;
+}
+.eq-slider-bound:focus::selection {
+  background: highlight;
+}
+.eq-slider {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px 3px 28px;
+}
+.eq-slider-range {
+  flex: 1;
+  min-width: 0;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.eq-slider-bound {
+  flex: none;
+  width: 46px;
+  border: none;
+  outline: none;
+  background: none;
+  font:
+    11px 'Eq Math Glyphs',
+    ui-monospace,
+    'SF Mono',
+    Menlo,
+    monospace;
+  color: var(--bound);
+  text-align: center;
+  appearance: textfield;
+  -moz-appearance: textfield;
+  /* Editable despite sitting inside a non-selectable .eq-widget. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+.eq-slider-bound:focus {
+  color: var(--bound-focus);
+}
+.eq-slider-bound::-webkit-outer-spin-button,
+.eq-slider-bound::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.eq-levels {
+  display: block;
+  margin: 0 0 3px 28px; /* clears the color-dot gutter, like the other widgets */
+  border: 1px solid var(--dot-border);
+  border-radius: 2px;
+  background: none;
+  color: var(--muted);
+  font:
+    10.5px ui-sans-serif,
+    system-ui,
+    sans-serif;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.eq-levels:hover {
+  color: var(--muted-hover);
+  border-color: var(--panel-border);
+}
+/* "on" inverts against the page so it reads in both themes. */
+.eq-levels.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--page-bg);
+}
+.eq-curve {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px 3px 28px;
+}
+.eq-curve-label {
+  flex: none;
+  font:
+    11px 'Eq Math Glyphs',
+    ui-monospace,
+    'SF Mono',
+    Menlo,
+    monospace;
+  color: var(--bound);
+}
+.eq-curve-toggle {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font:
+    italic 12px ui-sans-serif,
+    system-ui;
+  color: var(--summary);
+  cursor: pointer;
+}
+.eq-curve-toggle input {
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.eq-error {
+  color: var(--error);
+  font-size: 11px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  padding: 0 6px 3px 28px;
+}
+/* A data row whose file is missing heals by supplying the file, so its error
+   doubles as the button that asks for one. */
+.eq-error-pick {
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+.eq-info {
+  color: var(--info);
+  font-size: 11px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  /* Every digit one width, so a readout that changes each frame keeps its
+     length and the rows below do not jump as it rewraps. */
+  font-variant-numeric: tabular-nums;
+  padding: 0 6px 3px 28px;
+}
+
+/* A data row's readout, doubling as the handle on a preview of the file. */
+.eq-table {
+  padding: 0 6px 3px 28px;
+  font-size: 11px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
+.eq-table > summary {
+  color: var(--info);
+  cursor: pointer;
+}
+.eq-table > summary:hover {
+  color: var(--summary-hover);
+}
+.eq-table-scroll {
+  max-height: 180px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 4px 0 2px;
+  border: 1px solid var(--divider);
+  border-radius: 4px;
+}
+.eq-table table {
+  border-collapse: collapse;
+  font:
+    11px 'Eq Math Glyphs',
+    ui-monospace,
+    'SF Mono',
+    Menlo,
+    monospace;
+  color: var(--ex-text);
+}
+.eq-table th,
+.eq-table td {
+  padding: 2px 8px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--divider);
+}
+.eq-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-bg);
+  color: var(--summary);
+  font-weight: 500;
+}
+.eq-table .num {
+  text-align: right;
+}
+.eq-table .more {
+  color: var(--muted);
+  text-align: center;
+  font-style: italic;
+}
+
+/* Dragging a CSV over the window: the whole page is the drop target. */
+body.file-drag::after {
+  content: 'Drop a .csv to plot it';
+  position: fixed;
+  inset: 12px;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--accent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--page-bg) 70%, transparent);
+  color: var(--accent);
+  font:
+    600 16px ui-sans-serif,
+    system-ui,
+    sans-serif;
+  pointer-events: none;
+}
+
+/* Transient message for events with no row to live on (an unreadable file). */
+.notice {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translate(-50%, 12px);
+  z-index: 70;
+  max-width: min(560px, 90vw);
+  padding: 8px 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  box-shadow: 0 4px 16px var(--panel-shadow);
+  color: var(--text);
+  font:
+    12px ui-sans-serif,
+    system-ui,
+    sans-serif;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.15s,
+    transform 0.15s;
+}
+.notice.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+/* Per-row display toggles (Σ partial sums on sequences, bars on data lists). */
+.eq-toggles {
+  display: flex;
+  gap: 6px;
+  padding: 0 6px 4px 28px;
+}
+.eq-toggle {
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  background: none;
+  color: var(--muted);
+  font:
+    11px ui-sans-serif,
+    system-ui,
+    sans-serif;
+  line-height: 1;
+  cursor: pointer;
+  padding: 3px 8px;
+}
+.eq-toggle:hover {
+  color: var(--muted-hover);
+}
+.eq-toggle.on {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+/* The panel's bottom row: examples on the left, the links on the right. Only
+   the labels are buttons, so the space between them is inert. */
+#panel-footer {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  border-top: 1px solid var(--divider);
+  margin-top: 4px;
+  font-size: 12px;
+}
+#examples {
+  border: none;
+  background: none;
+  padding: 6px;
+  font: inherit;
+  color: var(--muted);
+  cursor: pointer;
+}
+#examples:hover {
+  color: var(--muted-hover);
+}
+/* Local data files: a folding list under the equations, one row per file. */
+#data-files {
+  flex: none;
+  max-height: 30%;
+  overflow-y: auto;
+  overscroll-behavior: none;
+  border-top: 1px solid var(--divider);
+  margin-top: 4px;
+  padding: 4px;
+  font-size: 12px;
+}
+#data-files > summary {
+  color: var(--muted);
+  cursor: pointer;
+  padding: 2px;
+}
+#data-files > summary:hover {
+  color: var(--muted-hover);
+}
+.file-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 4px 2px 14px;
+  color: var(--ex-text);
+}
+.file-item span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-item code {
+  color: var(--ex-code);
+  font-size: 11px;
+}
+.file-del,
+.file-add {
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+}
+.file-del:hover {
+  color: var(--error);
+}
+.file-add {
+  display: block;
+  padding: 3px 4px 3px 14px;
+  text-align: left;
+}
+.file-add:hover {
+  color: var(--muted-hover);
+}
+
+#panel-links {
+  margin-left: auto;
+  padding-right: 6px;
+  font-size: 12px;
+  display: flex;
+  gap: 10px;
+}
+#panel-links a,
+#panel-links button {
+  color: var(--muted);
+  text-decoration: none;
+}
+#panel-links button {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+#panel-links a:hover,
+#panel-links button:hover {
+  color: var(--muted-hover);
+  text-decoration: underline;
+}
+/* The examples popup (examples-menu.ts): categories, then one category's
+   examples, each a screenshot card. */
+#examples-dialog {
+  width: min(960px, calc(100vw - 32px));
+  height: min(760px, calc(100dvh - 32px));
+  max-width: none;
+  max-height: none;
+  padding: 0;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  background: var(--page-bg);
+  color: var(--text);
+  box-shadow: 0 12px 48px var(--panel-shadow);
+  overflow: hidden;
+}
+#examples-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+#examples-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+.exd-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--divider);
+}
+.exd-head h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+.exd-search {
+  flex: 0 1 260px;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 2px;
+  background: var(--page-bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+.exd-search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.exd-search[hidden] {
+  display: none;
+}
+.exd-empty {
+  grid-column: 1 / -1;
+  margin: 24px 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+.exd-back,
+.exd-close {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 2px;
+  background: none;
+  color: var(--muted);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+.exd-back:hover,
+.exd-close:hover {
+  background: var(--ex-hover-bg);
+  color: var(--muted-hover);
+}
+.exd-grid {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  /* The cards clip their corners (overflow: hidden), which lets auto rows
+     squeeze them to fit the dialog; they keep their full height instead. */
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 14px;
+  padding: 14px;
+}
+.exd-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 0 0 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 2px;
+  background: none;
+  overflow: hidden;
+  text-align: left;
+  font: inherit;
+  color: var(--ex-text);
+  cursor: pointer;
+}
+.exd-card.selected,
+.exd-card:focus-visible {
+  border-color: var(--accent);
+  background: var(--row-focus);
+  outline: none;
+}
+.exd-card img {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 4 / 3;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--divider);
+  /* Hold the shot's canvas color while it loads. */
+  background: var(--page-bg);
+}
+.exd-name {
+  padding: 0 8px;
+  font-size: 13px;
+}
+/* A category among the cards: a stack of shots rather than one, in bold. */
+.exd-card.exd-cat {
+  overflow: visible;
+  box-shadow:
+    4px -4px 0 -1px var(--page-bg),
+    4px -4px 0 0 var(--panel-border);
+}
+.exd-card.exd-cat img {
+  border-radius: 1px 1px 0 0;
+}
+.exd-card.exd-cat.selected {
+  box-shadow:
+    4px -4px 0 -1px var(--page-bg),
+    4px -4px 0 0 var(--accent);
+}
+.exd-cat .exd-name {
+  font-weight: 600;
+}
+.exd-card code {
+  /* Set like an equation row: a bar down the left, on the row-focus tint. */
+  margin: 4px 8px 0;
+  padding: 3px 6px 3px 8px;
+  border-left: 3px solid var(--accent);
+  background: var(--row-focus);
+  color: var(--ex-code);
+  font:
+    10.5px 'Eq Math Glyphs',
+    ui-monospace,
+    Menlo,
+    monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.exd-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 8px 0;
+}
+.exd-tag {
+  padding: 1px 6px;
+  border-radius: 2px;
+  background: var(--ex-hover-bg);
+  color: var(--summary);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+.exd-tag:hover {
+  background: var(--accent);
+  color: #fff;
+}
+.exd-cat code {
+  margin: 0;
+  padding: 0 8px;
+  border: none;
+  background: none;
+  font-family: inherit;
+  font-size: 11px;
+}
+@media (max-width: 600px) {
+  #examples-dialog {
+    width: 100vw;
+    height: 100dvh;
+    border: none;
+    border-radius: 0;
+    padding-top: var(--safe-area-top);
+    padding-bottom: var(--safe-area-bottom);
+  }
+  .exd-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    padding: 10px;
+  }
+}
+
+/* The panel's collapsed form: after a swipe dismisses the panel
+   (panel-swipe.ts), this chip pops into its corner. Tapping springs the
+   panel back; dragging pulls it back in under the finger. */
+#panel-chip {
+  position: absolute;
+  top: calc(12px + var(--safe-area-top));
+  left: calc(12px + var(--safe-area-left));
+  width: 46px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 20px var(--panel-shadow);
+  color: var(--text);
+  font:
+    15px/1 'Eq Math Glyphs',
+    ui-monospace,
+    'SF Mono',
+    Menlo,
+    monospace;
+  cursor: pointer;
+  /* A drag handle as much as a button: no browser pan may start on it, so
+     its touchmoves stay cancelable for the pull-open gesture. */
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  /* Hidden pose; .shown transitions from it, popping the chip in as the
+     panel clears the screen. A transition (not an animation) so JS can
+     stage the flip: unhide, reflow, then add .shown. */
+  opacity: 0;
+  transform: scale(0.5);
+  transition:
+    transform 0.26s cubic-bezier(0.34, 1.56, 0.64, 1),
+    opacity 0.18s ease-out;
+}
+#panel-chip.shown {
+  opacity: 1;
+  transform: none;
+}
+/* The chip sits at whichever corner the panel left from (same classes as
+   the panel's pinning, applied together in panel-swipe.ts). */
+#panel-chip.pin-right {
+  left: auto;
+  right: calc(12px + var(--safe-area-right));
+}
+#panel-chip.pin-bottom {
+  top: auto;
+  bottom: calc(12px + var(--panel-bottom-inset));
+}
+@media (prefers-reduced-motion: reduce) {
+  #panel-chip {
+    transition: opacity 0.15s ease-out;
+  }
+}
+
+/* Equation assistance sits outside the editable document and its widgets. */
+#syntax-help {
+  position: fixed;
+  z-index: 100;
+  width: 340px;
+  overflow: auto;
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  background: var(--page-bg);
+  color: var(--text);
+  box-shadow: 0 5px 24px var(--panel-shadow);
+  padding: 6px;
+  font:
+    12px/1.45 system-ui,
+    sans-serif;
+}
+#syntax-help[hidden],
+#syntax-help [hidden] {
+  display: none;
+}
+.syntax-hint {
+  padding: 7px 9px;
+  color: var(--info);
+  overflow-wrap: anywhere;
+}
+#syntax-suggestions button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  border: 0;
+  border-radius: 5px;
+  padding: 7px 9px;
+  text-align: left;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+#syntax-suggestions button:hover,
+#syntax-suggestions [aria-selected='true'] {
+  background: var(--ex-hover-bg);
+}
+#syntax-suggestions strong {
+  font:
+    13px 'Eq Math Glyphs',
+    ui-monospace,
+    monospace;
+  overflow-wrap: anywhere;
+}
+#syntax-suggestions span {
+  color: var(--summary);
+  font-size: 11px;
+  margin-top: 2px;
+}
+.syntax-keys {
+  padding: 6px 9px 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+/* Framed graphs start with the editor collapsed; hide chrome that belongs
+   to the full site. The y= chip and theme toggle stay. */
+html[data-embed] #panel-footer,
+html[data-embed] #data-files,
+html[data-embed] #shot,
+html[data-embed] #rec,
+html[data-embed] #try-another,
+html[data-embed] #open-csv {
+  display: none;
+}
+html[data-embed] #state-reset {
+  right: 34px;
+}
+
+/* Hide the editor before main.ts initializes the panel's collapsed state. */
+html[data-embed][data-embed-boot] #panel {
+  visibility: hidden;
+}

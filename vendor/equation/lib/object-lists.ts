@@ -1,0 +1,801 @@
+import type { ValueDefinitions } from './env.ts';
+import type { Mat } from './mat.ts';
+import { lowerMatrix, rowsAsPoints } from './geom.ts';
+import { mapChildren } from './expr.ts';
+import { tensorNode, tensorOfNode } from './tensor.ts';
+import { flatOfNode, isPoint, pointCoords } from './pga.ts';
+import { exceedsNodes } from './size.ts';
+import { hasInterval } from './interval.ts';
+/** Lift lists in object positions before scalar geometry lowering. Existing
+ * data/reduction paths get first refusal so large CSVs remain typed arrays. */
+import { type ResolveOpts, compsOf, listGetter, tensorGetter } from './defs.ts';
+import { WHOLE_EXPR_NAMES } from './complex.ts';
+import { MAP, type Expr, type FigureForm, childrenOf, compFits, freeVars, sameList } from './expr.ts';
+import { GEOM_STATEMENTS, lowerGeom } from './geom.ts';
+import { type Axis, axesOf, isDataScatter, lowerLists, SCALAR_REDUCTIONS, unionAxes, withAxes } from './list.ts';
+
+export const FAMILY_MAX = 32;
+/** Point figures are a handful of numbers each, evaluated on the CPU — not a
+ *  shader draw — so a family of them can be a whole lattice of arrows. */
+export const FIGURE_FAMILY_MAX = 1024;
+const num = (value: number): Expr => ({ kind: 'num', value });
+
+/** Reductions that take a multiset of points whole: count, and total and
+ *  mean coordinate by coordinate. */
+const REDUCES_POINTS = new Set(['count', 'total', 'mean']);
+/** Reductions that need an order or a scale, which a tensor has not. */
+const TENSOR_REFUSED = new Set(['min', 'max', 'median', 'stdev']);
+
+/** Points that meet, project and reflect made, as the tuples they are; any
+ *  other item as it stands. */
+function tupleItems(items: readonly Expr[]): Expr[] {
+  return items.map(it => {
+    const f = flatOfNode(it);
+    return f && isPoint(f) ? { kind: 'vec', items: pointCoords(f) } : it;
+  });
+}
+
+/** Figures that are just their points: moving the points moves the figure. */
+const POINT_FIGURES = new Set(['segment', 'polyline', 'polygon', 'vector', 'hull']);
+
+/**
+ * A transformed figure is the figure of the transformed points: `R hull(P)`,
+ * `polygon(A, B, C) + (1, 0)`, `2 segment(A, B)`, `rotate(hull(P), a)`. Every
+ * map a row can write this way is affine, and affine maps carry segments to
+ * segments and hulls to hulls — so the transform moves inside, onto each
+ * point (or the one point list), and the figure stays the whole statement.
+ */
+function pushTransforms(e: Expr, rowsOf: (arg: Expr) => readonly Expr[] | null): Expr {
+  const figure = (n: Expr): (Expr & { kind: 'call' }) | null =>
+    n.kind === 'call' && POINT_FIGURES.has(n.name) ? n : null;
+  const onto = (fig: Expr & { kind: 'call' }, move: (point: Expr) => Expr, shifts = false): Expr => {
+    // vector(V) starts at the origin, which a shift would have to move too.
+    if (shifts && fig.name === 'vector' && fig.args.length === 1) {
+      throw new Error('vector(V) starts at the origin — write vector(A, B) to move it.');
+    }
+    // A figure of a matrix's rows moves each row, as a point: R polygon(T)
+    // is polygon(R A, R B, …), not polygon(R T), the matrix product.
+    const args = (fig.args.length === 1 && rowsOf(fig.args[0])) || fig.args;
+    return { ...fig, args: args.map(move) };
+  };
+  switch (e.kind) {
+    case 'neg': {
+      const a = figure(pushTransforms(e.a, rowsOf));
+      return a ? onto(a, p => ({ kind: 'neg', a: p })) : e;
+    }
+    case 'bin': {
+      const l = pushTransforms(e.a, rowsOf),
+        r = pushTransforms(e.b, rowsOf);
+      const a = figure(l),
+        b = figure(r);
+      if (a && b) throw new Error('Two figures do not combine — transform one figure at a time.');
+      const shifts = e.op === '+' || e.op === '-';
+      if (a && e.op !== '^') return onto(a, p => ({ ...e, a: p, b: r }), shifts);
+      if (b && e.op !== '^' && e.op !== '/') return onto(b, p => ({ ...e, a: l, b: p }), shifts);
+      return e;
+    }
+    case 'call': {
+      if (e.name !== 'rotate' || !e.args.length) return e;
+      const a = figure(pushTransforms(e.args[0], rowsOf));
+      return a ? onto(a, p => ({ ...e, args: [p, ...e.args.slice(1)] })) : e;
+    }
+    default:
+      return e;
+  }
+}
+
+const holdsFigure = (e: Expr): boolean => {
+  switch (e.kind) {
+    case 'call':
+      return POINT_FIGURES.has(e.name) || e.args.some(holdsFigure);
+    case 'bin':
+      return holdsFigure(e.a) || holdsFigure(e.b);
+    case 'neg':
+      return holdsFigure(e.a);
+    default:
+      return false;
+  }
+};
+
+export function lowerObjects(e: Expr, defs: ValueDefinitions, opts: ResolveOpts = {}, named = false): Expr {
+  const plotVariable = (v: string) => ['x', 'y', 'z', 'u', 'v'].includes(v) || defs.fields.has(v);
+  // Drawn over something continuous: a plot variable, or an interval in a
+  // tuple, which traces as u does (lib/interval.ts) — so [(interval(0, 1),
+  // 1), …] is a family of segments, as [(u, 1), …] is of curves. (A bare
+  // interval is a number to draw the density of, and a list of them is not.)
+  const traced = (e: Expr): boolean => (e.kind === 'vec' && hasInterval(e)) || childrenOf(e).some(traced);
+  const continuous = (e: Expr) => [...freeVars(e)].some(plotVariable) || traced(e);
+  const baseGet = listGetter(defs);
+  const get = (name: string): Expr | null =>
+    baseGet(name) ?? (defs.mats.has(name) ? rowsAsPoints(defs.mats.get(name)!, name) : null);
+  // One answer per node: the argument of f(P) is shared by every component
+  // that reads it, and has to stay one node to be lowered once.
+  const indexed = new WeakMap<Expr, Expr>();
+  const indices = (n: Expr): Expr => {
+    let out = indexed.get(n);
+    if (!out) indexed.set(n, (out = indicesOf(n)));
+    return out;
+  };
+  // T[2] of a tensor is a slice of it, which geometry lowering takes.
+  const ofTensor = (n: Expr): boolean =>
+    n.kind === 'var' ? defs.tensors.has(n.name) : n.kind === 'index' && ofTensor(n.args[0]);
+  const indicesOf = (n: Expr): Expr => {
+    if (n.kind === 'index') {
+      if (ofTensor(n.args[0])) return n;
+      // A named point is a tuple of its coordinates (docs/multisets.md §3):
+      // T[2] of T = (3, 1, 2) is 1.
+      const target = n.args[0];
+      const comps = target.kind === 'var' && defs.pointDims.has(target.name) ? compsOf(defs, target.name) : null;
+      if (comps) {
+        const tuple = withAxes<Expr>({ kind: 'list', items: comps.map((name): Expr => ({ kind: 'var', name })) }, [
+          { id: `${(target as Expr & { kind: 'var' }).name}#0`, n: comps.length, ordered: true },
+        ]);
+        return lowerLists({ ...n, args: [tuple, n.args[1]] }, get, opts, true);
+      }
+      return lowerLists(n, get, opts, true);
+    }
+    switch (n.kind) {
+      case 'call':
+        return { ...n, args: n.args.map(indices) };
+      case 'bin':
+        return { ...n, a: indices(n.a), b: indices(n.b) };
+      case 'neg':
+        return { ...n, a: indices(n.a) };
+      case 'eq':
+      case 'ineq':
+        return { ...n, l: indices(n.l), r: indices(n.r) };
+      case 'vec':
+      case 'list':
+        return sameList(n, { ...n, items: n.items.map(indices) });
+      case 'piecewise':
+        return {
+          ...n,
+          cases: n.cases.map(c => ({ cond: indices(c.cond), value: indices(c.value) })),
+          otherwise: n.otherwise && indices(n.otherwise),
+        };
+      default:
+        return mapChildren(n, indices);
+    }
+  };
+  if (!exceedsNodes(e, 32768)) e = indices(e);
+  const ordinary = (e: Expr, packed = false) =>
+    lowerLists(
+      lowerGeom(
+        e,
+        n => compsOf(defs, n),
+        n => defs.mats.get(n) ?? null,
+        n => get(n) !== null,
+        tensorGetter(defs),
+      ),
+      get,
+      opts,
+      named,
+      packed,
+    );
+  // A list's elements, with the instances it runs over (see Axis in list.ts).
+  type ListValue = { items: readonly Expr[]; axes: readonly Axis[] };
+  // Coordinate lists settleComps wrote in: values already, one node each to
+  // the expansion's size limit — not a tree it would have to walk.
+  const settledLists = new WeakSet<object>();
+  const listValues = new WeakMap<Expr, ListValue | null>();
+  const listValue = (e: Expr): ListValue | null => {
+    let hit = listValues.get(e);
+    if (hit === undefined) listValues.set(e, (hit = listValueOf(e)));
+    return hit;
+  };
+  /** A matrix consumed as its rows (docs/multisets.md §3): a named one, or
+   *  algebra that makes one — M N, 2 T, T + (1, 0) — computed as the matrix
+   *  first, so polyline(M N) draws what P = M N; polyline(P) draws. */
+  const matrixRows = (e: Expr): ListValue | null => {
+    // A list of points beside a matrix (R P) is a multiset of points, not
+    // a matrix scaled by a list: the paths below take it point by point.
+    for (const v of freeVars(e)) {
+      if (defs.mats.has(v) || get(v) === null) continue;
+      const items = listValue({ kind: 'var', name: v });
+      if (!items || items.items.some(p => p.kind === 'vec')) return null;
+    }
+    let m: Mat | null;
+    try {
+      m =
+        e.kind === 'var'
+          ? (defs.mats.get(e.name) ?? null)
+          : lowerMatrix(
+              e,
+              n => compsOf(defs, n),
+              n => defs.mats.get(n) ?? null,
+              tensorGetter(defs),
+              n => get(n) !== null,
+            );
+    } catch {
+      return null;
+    }
+    if (!m) return null;
+    const rows = rowsAsPoints(m, e.kind === 'var' ? e.name : undefined);
+    // With a list among its entries, M is a multiset of matrices, so its
+    // rows are a multiset of tuples of points: M = ((a, 0), (0, 1)). The
+    // entries lower as one tuple (4 or 9 of them, so never a point), whose
+    // positions, innermost, regroup into rows.
+    const entries = m.flat();
+    if (entries.some(it => [...freeVars(it)].some(v => get(v) !== null))) {
+      const value = lowerLists({ kind: 'vec', items: entries }, get, opts, true);
+      const axes = value.kind === 'list' ? axesOf(value) : [];
+      if (value.kind === 'list' && axes.at(-1)?.ordered && axes.at(-1)!.n === entries.length) {
+        const width = m[0].length;
+        return {
+          items: Array.from({ length: value.items.length / width }, (_, k): Expr => ({
+            kind: 'vec',
+            items: value.items.slice(k * width, (k + 1) * width),
+          })),
+          axes: [...axes.slice(0, -1), ...axesOf(rows)],
+        };
+      }
+    }
+    return { items: rows.items, axes: axesOf(rows) };
+  };
+  const listValueOf = (e: Expr): ListValue | null => {
+    let value: Expr;
+    if (e.kind === 'var' && defs.mats.has(e.name)) return matrixRows(e);
+    try {
+      value = ordinary(e);
+    } catch {
+      return null;
+    }
+    if (value.kind === 'list') return { items: value.items, axes: axesOf(value) };
+    if (value.kind === 'data') {
+      if (value.values.length > 100000) throw new Error('A point path accepts at most 100000 vertices.');
+      return { items: Array.from(value.values, num), axes: axesOf(value) };
+    }
+    if (isDataScatter(value) && value.kind === 'vec') {
+      const n = value.items.find(c => c.kind === 'data')! as Expr & { kind: 'data' };
+      if (n.values.length > 100000) throw new Error('A point path accepts at most 100000 vertices.');
+      return {
+        items: Array.from(n.values, (_, k) => ({
+          kind: 'vec',
+          items: value.items.map(c => (c.kind === 'data' ? num(c.values[k]) : c)),
+        })),
+        axes: axesOf(n),
+      };
+    }
+    return null;
+  };
+  // A transformed figure. A list in the TRANSFORM is one figure per element —
+  // e^(th J) hull(P) is a rosette of hulls, not the hull of every copy — so
+  // those expand first, around the figure; then the transform moves inside.
+  // (Sized first: the size walk stops at its limit, a figure hunt would not.)
+  if (!(e.kind === 'call' && POINT_FIGURES.has(e.name)) && !exceedsNodes(e, 32768) && holdsFigure(e)) {
+    const family = expand(e, true);
+    if (family) return family;
+    e = pushTransforms(e, arg => {
+      // (A multiset of matrices keeps its argument: its rows are not one tuple.)
+      const rows = matrixRows(arg);
+      return rows && rows.axes.length === 1 ? rows.items : null;
+    });
+  }
+  // Connectedness consumes a whole list; it does not broadcast its vertices
+  // into separate one-vertex figures. Also accepts a zipped CSV scatter.
+  if (e.kind === 'call' && ['polyline', 'polygon', 'hull'].includes(e.name) && e.args.length === 1) {
+    const arg = e.args[0];
+    // A tuple of points written out — polyline(((0, 0), (1, 1), (2, 0))),
+    // polygon((A, B, C)) — is its points in order: the argument list again.
+    const point = (p: Expr) => p.kind === 'vec' || (p.kind === 'var' && compsOf(defs, p.name) !== null);
+    if (arg.kind === 'vec' && arg.items.length >= 2 && arg.items.every(point)) {
+      return lowerObjects({ ...e, args: arg.items }, defs, opts, named);
+    }
+    // A path or a polygon walks its points in order, so it takes a tuple; a
+    // hull is the same whatever the order (docs/multisets.md §3).
+    const form = e.name;
+    const inOrder = (axes: readonly Axis[]): void => {
+      if (form === 'hull' || axes.some(a => a.ordered)) return;
+      const P = arg.kind === 'var' ? arg.name : 'P';
+      throw new Error(`${form} needs an order — a list [ … ] has none. Sort it: ${form}(sort(${P}, ${P}.x)).`);
+    };
+    // A matrix is its rows, computed as the matrix first (2 M, M N).
+    const asMatrix = matrixRows(arg);
+    // Points computed over packed numbers with a slider or t in the way —
+    // polyline(F(k)) through thousands of k — stay one vertex template.
+    if (!asMatrix) {
+      let value: Expr | null = null;
+      try {
+        value = ordinary(arg, true);
+      } catch {
+        /* the paths below report it */
+      }
+      if (value?.kind === 'lazy') {
+        const axes = axesOf(value);
+        inOrder(axes);
+        const lazy = value;
+        return walkEach(axes, cut =>
+          packedFigure(form as 'polyline' | 'polygon' | 'hull', {
+            ...lazy,
+            cols: lazy.cols.map(c => ({ name: c.name, values: Float64Array.from(cut, k => c.values[k]) })),
+          }),
+        );
+      }
+    }
+    // A point list may itself be computed — R P, P + (1, 0), rotate(P, a) —
+    // which is the expansion below, asked for the values it yields.
+    const computed = (arg: Expr): ListValue | null => {
+      try {
+        const value = lowerObjects(arg, defs, opts, true);
+        return value.kind === 'list' ? { items: value.items, axes: axesOf(value) } : null;
+      } catch {
+        return null;
+      }
+    };
+    const found = asMatrix ?? listValue(arg) ?? computed(arg);
+    const pts = found && { ...found, items: tupleItems(found.items) };
+    if (pts) {
+      if (!pts.items.every(p => p.kind === 'vec')) throw new Error(`${e.name} needs a list of points.`);
+      inOrder(pts.axes);
+      const call = e;
+      return walkEach(pts.axes, cut => ordinary({ ...call, args: cut.map(k => pts.items[k]) }));
+    }
+  }
+  let originalError: unknown;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const value = ordinary(e);
+      // Lists of functions/parametrics become families; constant lists retain
+      // their existing dot/scatter representation and unbounded data path.
+      if (value.kind !== 'list' || !value.items.some(continuous)) return value;
+      break;
+    } catch (err) {
+      originalError ??= err;
+    }
+    // f(R P), f(P + (1, 0)): the argument is a point list only this pass can
+    // compute. Settle it ONCE, as the lists of its coordinates, and the row
+    // is ordinary again — mean(g(2 P)) included, which no family could be.
+    const settled = attempt === 0 && !exceedsNodes(e, 32768) ? settleComps(e) : e;
+    if (settled === e) break;
+    e = settled;
+  }
+  // A bracket that mixes tuples with other things is wrong as written, and a
+  // reduction a multiset of tuples has no answer for (sort, max) is too; one
+  // member per element would only hide that — sort would sort each tuple's
+  // own values (docs/multisets.md §2, §9).
+  if (
+    originalError instanceof Error &&
+    /A multiset (of \d+-tuples cannot|holds tuples)|of a multiset of \d+-tuples is not defined|takes real numbers, and these are complex/.test(
+      originalError.message,
+    )
+  ) {
+    throw originalError;
+  }
+  try {
+    return expand(e, false)!;
+  } catch (err) {
+    // A matrix or tensor error is about the matrix: the expansion's own
+    // complaint, made while reading things as lists of points, would only
+    // bury it. So is a sort key's: expanded, sort(P, L) is only ever handed
+    // single values.
+    throw originalError instanceof Error &&
+      ((/matri|tensor/i.test(originalError.message) && !/not a value on its own/.test(originalError.message)) ||
+        /sort\(P, P\.x\)/.test(originalError.message))
+      ? originalError
+      : err;
+  }
+
+  /**
+   * A connected figure walks the positions of its tuple; every other axis is a
+   * multiset of such tuples, and gives one figure per element — a family, as
+   * the tuple written out would (docs/multisets.md §3). `figure` builds one
+   * member from the flat indices of its vertices, in order. (A hull of a
+   * plain multiset has no positions: all of it is the one figure.)
+   */
+  function walkEach(axes: readonly Axis[], figure: (cut: number[]) => Expr): Expr {
+    const total = axes.reduce((size, a) => size * a.n, 1);
+    const at = axes.findIndex(a => a.ordered);
+    if (at < 0 || axes.length === 1) return figure(Array.from({ length: total }, (_, k) => k));
+    const n = axes[at].n;
+    const inner = axes.slice(at + 1).reduce((size, a) => size * a.n, 1);
+    const members = total / n;
+    if (members > FIGURE_FAMILY_MAX) {
+      throw new Error(`An object family needs 1–${FIGURE_FAMILY_MAX} members (got ${members}).`);
+    }
+    if (named) throw new Error('An object family is a whole row; give it a row of its own.');
+    return {
+      kind: 'family',
+      members: Array.from({ length: members }, (_, m) => {
+        const base = Math.floor(m / inner) * n * inner + (m % inner);
+        return figure(Array.from({ length: n }, (_, k) => base + k * inner));
+      }),
+    };
+  }
+
+  /** A named matrix with a list among its entries as the multiset of matrices
+   *  it is, each written out as its tuple of rows; null for one matrix. */
+  function matrices(name: string): ListValue | null {
+    const m = defs.mats.get(name)!;
+    const entries = m.flat();
+    if (!entries.some(it => [...freeVars(it)].some(v => get(v) !== null))) return null;
+    // (More than 3 entries, so a tuple: the positions innermost.)
+    const value = lowerLists({ kind: 'vec', items: entries }, get, opts, true);
+    if (value.kind !== 'list') return null;
+    const axes = axesOf(value);
+    if (axes.length < 2 || !axes.at(-1)!.ordered) return null;
+    const n = entries.length;
+    const size = m.length;
+    const items = Array.from({ length: value.items.length / n }, (_, k): Expr => {
+      const flat = value.items.slice(k * n, (k + 1) * n);
+      return {
+        kind: 'vec',
+        items: Array.from({ length: size }, (_, r): Expr => ({
+          kind: 'vec',
+          items: flat.slice(r * size, (r + 1) * size),
+        })),
+      };
+    });
+    return { items, axes: axes.slice(0, -1) };
+  }
+
+  /** A connected figure through a template of points: the template is its one
+   *  vertex, evaluated once per element of the columns (see `over`). */
+  function packedFigure(form: 'polyline' | 'polygon' | 'hull', points: Expr & { kind: 'lazy' }): Expr {
+    // (A point that a motor or meet made is the tuple it is.)
+    const [vertex] = tupleItems([points.body]);
+    if (vertex.kind !== 'vec' || (vertex.items.length !== 2 && vertex.items.length !== 3))
+      throw new Error(`${form} needs a list of points.`);
+    const n = points.cols[0].values.length;
+    if (n > 100000) throw new Error('A point path accepts at most 100000 vertices.');
+    const least = form === 'polyline' ? 2 : 3;
+    if (n < least) {
+      throw new Error(
+        form === 'polyline'
+          ? 'polyline needs at least 2 points: polyline(A, B, C).'
+          : form === 'hull'
+            ? 'hull needs at least 3 points: hull(A, B, C, D), or hull(P) for a list of points.'
+            : 'polygon needs at least 3 vertices.',
+      );
+    }
+    return {
+      kind: 'figure',
+      form: form as FigureForm,
+      dimension: vertex.items.length as 2 | 3,
+      vertices: vertex.items,
+      over: points.cols,
+    };
+  }
+
+  /** Every `[comp]` whose value is a computed point list, replaced by the list
+   *  of that coordinate — over the value's own instances, so they still zip. */
+  function settleComps(root: Expr): Expr {
+    const done = new WeakMap<Expr, Expr>();
+    const points = new WeakMap<Expr, Expr | null>();
+    const walk = (n: Expr): Expr => {
+      let out = done.get(n);
+      if (!out) done.set(n, (out = walkOf(n)));
+      return out;
+    };
+    const all = (ns: readonly Expr[]): readonly Expr[] => {
+      const out = ns.map(walk);
+      return out.every((o, k) => o === ns[k]) ? ns : out;
+    };
+    const walkOf = (n: Expr): Expr => {
+      switch (n.kind) {
+        case 'neg': {
+          const a = walk(n.a);
+          return a === n.a ? n : { ...n, a };
+        }
+        case 'bin': {
+          const a = walk(n.a),
+            b = walk(n.b);
+          return a === n.a && b === n.b ? n : { ...n, a, b };
+        }
+        case 'eq':
+        case 'ineq': {
+          const l = walk(n.l),
+            r = walk(n.r);
+          return l === n.l && r === n.r ? n : { ...n, l, r };
+        }
+        case 'vec':
+        case 'list': {
+          const items = all(n.items);
+          return items === n.items ? n : sameList(n, { ...n, items });
+        }
+        case 'piecewise': {
+          const cases = n.cases.map(c => ({ cond: walk(c.cond), value: walk(c.value) }));
+          const otherwise = n.otherwise && walk(n.otherwise);
+          return otherwise === n.otherwise &&
+            cases.every((c, k) => c.cond === n.cases[k].cond && c.value === n.cases[k].value)
+            ? n
+            : { ...n, cases, otherwise };
+        }
+        case 'comp': {
+          const value = walk(n.value);
+          const call = value === n.value ? n : { ...n, value };
+          let pts = points.get(value);
+          if (pts === undefined) {
+            try {
+              pts = lowerObjects(value, defs, opts, true);
+            } catch {
+              pts = null;
+            }
+            points.set(value, pts);
+          }
+          const dim = n.arity;
+          // (Anything else — one point, a wrong dimension — is the ordinary path's to judge.)
+          if (
+            pts?.kind !== 'list' ||
+            !pts.items.length ||
+            !pts.items.every(p => p.kind === 'vec' && compFits(dim, n.index, p.items.length))
+          )
+            return call;
+          const k = n.index;
+          const coords = withAxes<Expr>(
+            { kind: 'list', items: pts.items.map(p => (p as Expr & { kind: 'vec' }).items[k]) },
+            axesOf(pts),
+          );
+          settledLists.add(coords);
+          return coords;
+        }
+        case 'call': {
+          // max(P ⊗ P): the other reductions have no order on tensors.
+          if (TENSOR_REFUSED.has(n.name) && n.args.length === 1) {
+            let value: Expr | null;
+            try {
+              value = lowerObjects(n.args[0], defs, opts, true);
+            } catch {
+              value = null;
+            }
+            if (value?.kind === 'list' && value.items.length && value.items.every(it => tensorOfNode(it))) {
+              throw new Error(`${n.name} is not defined for tensors — total, mean and count take them entry by entry.`);
+            }
+          }
+          // count(2 P), mean(R P): a reduction takes the computed multiset
+          // of points whole (§3), rather than one member per point.
+          if (REDUCES_POINTS.has(n.name) && n.args.length === 1) {
+            let pts: Expr | null;
+            try {
+              pts = lowerObjects(n.args[0], defs, opts, true);
+            } catch {
+              pts = null;
+            }
+            // Points that meet and join made are the tuples they are; lines
+            // and planes count, but have no total or mean.
+            const flats = pts?.kind === 'list' ? pts.items.map(flatOfNode) : [];
+            if (pts?.kind === 'list' && flats.length && flats.every(f => f)) {
+              if (flats.every(f => isPoint(f!)))
+                pts = withAxes<Expr>({ kind: 'list', items: tupleItems(pts.items) }, axesOf(pts));
+              else if (n.name === 'count') return num(flats.length);
+              else throw new Error(`${n.name} is not defined for lines and planes — count takes them.`);
+            }
+            if (pts?.kind === 'list' && pts.items.length && pts.items.every(p => p.kind === 'vec')) {
+              settledLists.add(pts);
+              return { ...n, args: [pts] };
+            }
+            // total(P ⊗ P), mean of a multiset of matrices: entry by entry,
+            // as a point's are coordinate by coordinate — one tensor.
+            const tensors = pts?.kind === 'list' ? pts.items.map(tensorOfNode) : [];
+            const shape = tensors[0]?.shape.join();
+            if (pts?.kind === 'list' && tensors.length && tensors.every(t => t && t.shape.join() === shape)) {
+              if (n.name === 'count') return num(tensors.length);
+              const axes = axesOf(pts);
+              const first = tensors[0]!;
+              return tensorNode({
+                shape: first.shape,
+                data: first.data.map((_, i) => {
+                  const entries = withAxes<Expr>({ kind: 'list', items: tensors.map(t => t!.data[i]) }, axes);
+                  settledLists.add(entries);
+                  return { ...n, args: [entries] };
+                }),
+              });
+            }
+          }
+          return mapChildren(n, walk);
+        }
+        default:
+          return mapChildren(n, walk);
+      }
+    };
+    return walk(root);
+  }
+
+  /** One member per combination of the lists in `source`. `outside`: only the
+   *  lists around a figure, each member a figure lowered in its own right;
+   *  null when there are none. */
+  function expand(source: Expr, outside: boolean): Expr | null {
+    if (exceedsNodes(source, 32768, n => settledLists.has(n)))
+      throw new Error('This object family is too large to expand (32768 nodes).');
+    const lists: ListValue[] = [];
+    const markers = new Map<Expr, number>();
+    // Inside a recursive function's loop, its params are its own names, not
+    // the document lists or matrices they may share a spelling with.
+    let bound: ReadonlySet<string> = new Set();
+    /** Whether a [map] argument was expanded here (point-list arithmetic). */
+    let mapArgs = false;
+    const mentionsBound = (node: Expr): boolean => bound.size > 0 && [...freeVars(node)].some(v => bound.has(v));
+    // A matrix name is the matrix, not a list of row-points, along the row's
+    // own algebra (2 M, M v). Those rows are a list only where a call asks for
+    // points — hull(M), distance(P, A) — and there still not as the matrix
+    // factor of a product.
+    const visit = (node: Expr, asMatrix = true): Expr => {
+      if (node.kind === 'var' && bound.has(node.name)) return node;
+      if (asMatrix && node.kind === 'var' && defs.mats.has(node.name)) {
+        // M = ((a, 0), (0, 1)) is a multiset of matrices: one per member,
+        // chosen with every other use of a, so M Q pairs up with Q = M P.
+        const each = matrices(node.name);
+        if (!each) return node;
+        const marker = num(0);
+        markers.set(marker, lists.length);
+        lists.push(each);
+        return marker;
+      }
+      // Around a figure, only the transform's lists count: the figure keeps its own.
+      if (outside && node.kind === 'call' && POINT_FIGURES.has(node.name)) return node;
+      // A matrix over a list (e^(th J), th J) reads out as one [tensor] node
+      // per element: a value for a row of its own, but no factor a member can
+      // evaluate. Its lists expand inside it instead, so each member holds
+      // the matrix e^(th_k J) as algebra and applies it.
+      const values = mentionsBound(node) ? null : listValue(node);
+      if (values && !values.items.some(it => tensorOfNode(it))) {
+        if (values.items.length > 100000) throw new Error('Point-list arithmetic needs at most 100000 values.');
+        const marker = num(0);
+        markers.set(marker, lists.length);
+        lists.push(values);
+        return marker;
+      }
+      const map = (nodes: readonly Expr[]) => nodes.map(n => visit(n, asMatrix));
+      // A piecewise condition is decided per member, never a list of its own:
+      // as a value `k < 3` is the members kept, so taking it whole would drop
+      // the comparison and cross those members with k. Its sides are what
+      // expand — a chain's inner comparison too, unless written in
+      // parentheses as an operand ((L > 1) > 1 compares L's kept members).
+      const cond = (c: Expr): Expr => {
+        if (c.kind === 'ineq')
+          return { ...c, l: c.l.kind === 'ineq' && !c.l.grouped ? cond(c.l) : visit(c.l), r: visit(c.r) };
+        if (c.kind === 'eqtest') return { ...c, args: [visit(c.args[0]), visit(c.args[1])] };
+        return visit(c);
+      };
+      switch (node.kind) {
+        case 'bin':
+          return { ...node, a: visit(node.a, asMatrix || node.op === '*'), b: visit(node.b, asMatrix) };
+        case 'neg':
+          return { ...node, a: visit(node.a, asMatrix) };
+        case 'eq':
+        case 'ineq':
+          return { ...node, l: visit(node.l), r: visit(node.r) };
+        case 'vec':
+          return { ...node, items: map(node.items) };
+        case 'call':
+          // A reduction takes its list whole, as staysList judges it: mean(s)
+          // is one number in every member, not s broadcast into mean.
+          if (
+            SCALAR_REDUCTIONS.has(node.name) ||
+            ((node.name === 'min' || node.name === 'max') && node.args.length === 1)
+          )
+            return node;
+          // A function applied per member ([map]) is list lowering's to run:
+          // its body's lists are its own, and a member that is a list or tuple
+          // collects there (lowerMap). An argument that is point-list
+          // arithmetic (P + (1, 0)) is expanded here on its own, as its row
+          // would be.
+          if (node.name === MAP)
+            return {
+              ...node,
+              args: node.args.map((n, i) => {
+                if (i < 3 || i % 2 === 0) return n;
+                try {
+                  const low = lowerObjects(n, defs, opts);
+                  if (low.kind !== 'list') return n;
+                  mapArgs = true;
+                  return low;
+                } catch {
+                  return n;
+                }
+              }),
+            };
+          return { ...node, args: node.args.map(n => visit(n, false)) };
+        case 'comp':
+          return { ...node, value: visit(node.value, false) };
+        case 'piecewise':
+          return {
+            ...node,
+            cases: node.cases.map(c => ({ cond: cond(c.cond), value: visit(c.value) })),
+            otherwise: node.otherwise && visit(node.otherwise),
+          };
+        case 'loop': {
+          const seeds = map(node.seeds);
+          const outer = bound;
+          bound = new Set([...outer, ...node.params]);
+          try {
+            return { ...node, seeds, body: visit(node.body, asMatrix) };
+          } finally {
+            bound = outer;
+          }
+        }
+        default:
+          return mapChildren(node, n => visit(n, asMatrix));
+      }
+    };
+    const template = visit(source);
+    if (!lists.length) {
+      // A [map] whose point-list argument was expanded here is no family:
+      // with that argument lowered, the row is ordinary again.
+      if (mapArgs) return ordinary(template);
+      if (outside) return null;
+      throw originalError ?? new Error('This expression cannot be expanded as an object family.');
+    }
+    // One member per instance: uses of the same list move together, lists with
+    // different origins are independent and cross.
+    // (Tuples meet by position: see unionAxes.)
+    const { union: axes, canon } = unionAxes(lists.map(l => l.axes));
+    const n = axes.reduce((size, a) => size * a.n, 1);
+    // A × [] = []: an empty multiset anywhere leaves no combinations.
+    // (A reduction that has no value there says so rather than vanishing.)
+    if (!n && !outside) {
+      if (originalError instanceof Error && /of an empty list/.test(originalError.message)) throw originalError;
+      return withAxes({ kind: 'list', items: [] }, axes);
+    }
+    if (n > 100000)
+      throw new Error(
+        `Independent lists combine every value with every other — that is ${n} combinations. Name one list and reuse it to pair values up instead.`,
+      );
+    // Where member k sits in each list: its own axes, row-major like the rest.
+    const at = (list: { axes: readonly Axis[] }, k: number): number => {
+      let index = 0;
+      for (let d = axes.length - 1, rest = k; d >= 0; rest = Math.floor(rest / axes[d].n), d--) {
+        const own = list.axes.findIndex(a => canon(a) === axes[d].id);
+        if (own < 0) continue;
+        index += (rest % axes[d].n) * list.axes.slice(own + 1).reduce((size, a) => size * a.n, 1);
+      }
+      return index;
+    };
+    const instantiate = (node: Expr, k: number): Expr => {
+      const hit = markers.get(node);
+      if (hit !== undefined) return lists[hit].items[at(lists[hit], k)];
+      const map = (ns: readonly Expr[]) => ns.map(n => instantiate(n, k));
+      switch (node.kind) {
+        case 'bin':
+          return { ...node, a: instantiate(node.a, k), b: instantiate(node.b, k) };
+        case 'neg':
+          return { ...node, a: instantiate(node.a, k) };
+        case 'eq':
+        case 'ineq':
+          return { ...node, l: instantiate(node.l, k), r: instantiate(node.r, k) };
+        case 'vec':
+          return { ...node, items: map(node.items) };
+        case 'call':
+          return { ...node, args: map(node.args) };
+        case 'piecewise':
+          return {
+            ...node,
+            cases: node.cases.map(c => ({ cond: instantiate(c.cond, k), value: instantiate(c.value, k) })),
+            otherwise: node.otherwise && instantiate(node.otherwise, k),
+          };
+        default:
+          return mapChildren(node, n => instantiate(n, k));
+      }
+    };
+    const objects =
+      outside ||
+      source.kind === 'eq' ||
+      source.kind === 'ineq' ||
+      continuous(source) ||
+      lists.some(l => l.items.some(continuous)) ||
+      (source.kind === 'call' && (GEOM_STATEMENTS.has(source.name) || WHOLE_EXPR_NAMES.has(source.name)));
+    const limit =
+      outside || (source.kind === 'call' && POINT_FIGURES.has(source.name)) ? FIGURE_FAMILY_MAX : FAMILY_MAX;
+    if (objects && n > limit) throw new Error(`An object family needs 1–${limit} members (got ${n}).`);
+    const members = Array.from({ length: n }, (_, k) =>
+      outside ? lowerObjects(instantiate(template, k), defs, opts) : ordinary(instantiate(template, k)),
+    );
+    const valuesOnly = members.every(
+      m =>
+        !continuous(m) &&
+        !['figure', 'trail', 'label', 'hist', 'family'].includes(m.kind) &&
+        m.kind !== 'eq' &&
+        m.kind !== 'ineq' &&
+        !(
+          m.kind === 'call' &&
+          (/^\[(polygon|segment|polyline|vector|square|hull|trail|hist)/.test(m.name) ||
+            GEOM_STATEMENTS.has(m.name) ||
+            WHOLE_EXPR_NAMES.has(m.name))
+        ),
+    );
+    // (Over the instances it was expanded along: Q = P + (1, 0) moves with P.)
+    if (valuesOnly) return withAxes({ kind: 'list', items: members }, axes);
+    if (n > limit) throw new Error(`An object family has at most ${limit} members.`);
+    if (named) throw new Error('An object family is a whole row; give it a row of its own.');
+    return { kind: 'family', members };
+  }
+}

@@ -1,0 +1,3790 @@
+import { Env, type Components, type ValueDefinitions, lowerValueRef } from './env.ts';
+import { MAP, childrenOf, LOOP_LIMIT, LOOP_LIMIT_MAX, RECUR, isRecur, loopLeaves } from './expr.ts';
+import { mapChildren, notACondition, structuralDiagnostic, legacyCallArgs } from './expr.ts';
+import { INTERVAL } from './expr.ts';
+/**
+ * User definitions and derivative syntax.
+ *
+ * - `a = 2` defines a constant (the UI shows it as a slider); `b = a^2 + t`
+ *   defines a computed constant. Constants stay symbolic through GLSL
+ *   compilation (they become uniforms) so dragging a slider never recompiles
+ *   a shader.
+ * - `a' = …` defines a state: da/dt, integrated forward as the graph animates
+ *   (see state.ts), starting from `a(0) = …`. A state is a constant whose
+ *   value carries between frames instead of being a formula in t, so systems
+ *   with no closed form — a driven oscillator, a double pendulum — animate.
+ * - `f(x) = x^3 - a x` defines a function; calls are inlined symbolically.
+ * - `d/dx (…)` (also `d^2/dx^2`, any single-letter variable) differentiates
+ *   symbolically at resolve time via diff().
+ * - `grad(f)`, `div(F)`, `curl(F)`, `laplacian(f)`, `jacobian` and `hessian`
+ *   (also ∇f, ∇·F, ∇×F, ∇²f) expand in lib/vector-calculus.ts, through named
+ *   fields (see throughFields).
+ * - Curve operators (`curvature`, `torsion`, `osculating`, `frame`) expand in
+ *   lib/curves.ts. Surface operators (`gaussian`, `meancurvature`) expand in
+ *   lib/surface-geometry.ts.
+ * - `sum(n=1..N, …)` / `prod(…)` (also Σ/Π, and `sum[n=1..N] …` binding the
+ *   trailing product like d/dx) expand in lib/sums.ts. The bounds must be
+ *   numbers or already-known constants. A bound that uses a sequence index
+ *   (`a_n = Σ(s=1..n, s)`) is left as a sum and evaluated per term instead.
+ * - `int(f dx)` / `int[a..b] f dx` (also ∫) expand in lib/integrate.ts: a
+ *   verified antiderivative when one exists, otherwise a fixed Gauss–Legendre
+ *   sum, so every downstream consumer still sees ordinary expressions.
+ */
+import { type SeqScan, sequenceResolver } from './seq.ts';
+import { lowerObjects } from './object-lists.ts';
+import { type Column, type Table, filterTable, positionColumn, rowPositions } from './csv.ts';
+import { NonSmoothError, add, diff, div, mul, neg, pow, sub } from './diff.ts';
+import {
+  FUNCTIONS,
+  GREEK_NAME_CHARS,
+  DRAW_OP_SRC,
+  NAME_SRC,
+  SHADOWABLE_FNS,
+  type Expr,
+  builtinFn,
+  REDEFINABLE,
+  canonicalName,
+  explicitAssignment,
+  reboundName,
+  writtenName,
+  compDims,
+  evaluate,
+  markOrigins,
+  freeVars,
+  ineqComparisons,
+  parseExpr,
+  revolveAxis,
+  sameList,
+  substVars,
+} from './expr.ts';
+import { HASH_TOKEN_LEN, shortHash } from './hash.ts';
+import { hasInterval, hiddenInterval } from './interval.ts';
+import { isReductionCall, reduceOverSet } from './measure.ts';
+import { expandInt, integral, stripDx, usesIntegral, type StripDx } from './integrate.ts';
+import { expandClosedSums, expandSum } from './sums.ts';
+import type { IntShade, ResolvedRow } from './intshade.ts';
+import {
+  lowerGeom,
+  lowerLineValue,
+  lowerMatrix,
+  lowerTensorValue,
+  pointComps,
+  rowsAsPoints,
+  vecStateComps,
+} from './geom.ts';
+import {
+  type GetList,
+  type Seq,
+  NO_LIST_INSIDE,
+  SCALAR_REDUCTIONS,
+  axesOf,
+  copiedList,
+  isDataScatter,
+  isSeq,
+  isTuple,
+  lowerLists,
+  lowerMask,
+  orderMessage,
+  namedAxes,
+  plainFnName,
+  reducesMembers,
+  tupleAxis,
+  withAxes,
+} from './list.ts';
+import type { Mat } from './mat.ts';
+import { type GetTensor, type Tensor, stack, tensorOfNode, toMat, vectorTensor } from './tensor.ts';
+import { bladeByName, mvNode, mvOfNode } from './clifford.ts';
+import { flatName, flatOfNode, isPoint, pointCoords, withHoisting } from './pga.ts';
+import { isComplexValued } from './complex.ts';
+import { SPLIT_NODE_BUDGET, realValue } from './complex-parts.ts';
+import { countNodes } from './size.ts';
+import { CURVE_OPS, curveGeometry } from './curves.ts';
+import { SURFACE_OPS, surfaceGeometry, surfaceOperand } from './surface-geometry.ts';
+import { VECTOR_OPS, splitNablaChain, vectorCalculus } from './vector-calculus.ts';
+
+export { surfaceOperand, usesIntegral };
+import { type RegressionRow, type FitResult, fitRegression } from './regression.ts';
+
+/** The axis variables: a definition reaching one is a coordinate field. */
+const SPACE: ReadonlySet<string> = new Set(['x', 'y', 'z']);
+/** The parametric parameters, each ranging over (0, 1) unless a row
+ *  defines it as an interval (`u = interval(0, 2pi)`). */
+const PARAMS: ReadonlySet<string> = new Set(['u', 'v']);
+/** Position: an axis variable, or w, the complex point x + iy. */
+const onPosition = (v: string): boolean => SPACE.has(v) || v === 'w';
+
+export type Definition =
+  | RegressionRow
+  /** `draw`: `p ∈ A` — p ranges over A's members, a choice of its own
+   *  (docs/multisets.md §0): equal to A, never identical to it. */
+  | { kind: 'const'; name: string; rhs: string; draw?: true }
+  | { kind: 'fn'; name: string; params: string[]; rhs: string }
+  /** `a' = …` — da/dt, integrated forward in time. */
+  | { kind: 'state'; name: string; rhs: string }
+  /** `a(0) = …` — where the state a starts. */
+  | { kind: 'init'; name: string; rhs: string }
+  /** `person = open("people.csv", 3a7f…)` — a local data file, pinned by
+   *  content hash. The bytes live on the device, not in the link. */
+  | { kind: 'table'; name: string; file: string; hash: string };
+
+/**
+ * Row identity for duplicate detection. `a = 1` and `a' = 2` share a key —
+ * a cannot be both a constant and a state — but `a(0)` is its own row.
+ */
+export const defKey = (d: Definition): string => (d.kind === 'init' ? `${d.name}(0)` : d.name);
+
+export interface FnDef {
+  params: string[];
+  /** Fully resolved: no user-function calls or derivative nodes remain. */
+  body: Expr;
+  /** The function now being resolved, seen from inside its own body: a call
+   *  becomes a RECUR marker, and the finished body wraps into a loop. */
+  recursive?: boolean;
+}
+
+/**
+ * A body that calls its own function runs as a bounded loop, provided every
+ * self-call is a whole case of the body's {…} (tail position): the call's
+ * arguments are then simply the next pass's parameters. Anything else —
+ * `n f(n - 1)`, a call inside a condition — would need a stack per pixel.
+ */
+function wrapRecursion(name: string, params: string[], body: Expr): Expr {
+  const p = params[0] ?? 'n';
+  const check = (e: Expr, tail: boolean): void => {
+    if (isRecur(e)) {
+      if (!tail)
+        throw new Error(
+          `${name} can only call itself as a whole case of {…}, like ${name}(${p}) = {${p} <= 1: 1, ${name}(${p} - 1)}.`,
+        );
+      return;
+    }
+    if (e.kind === 'piecewise' && tail) {
+      for (const c of e.cases) {
+        check(c.cond, false);
+        check(c.value, true);
+      }
+      if (e.otherwise) check(e.otherwise, true);
+      return;
+    }
+    // A loop already inlined here (a call to another recursive function)
+    // owns the markers in its body; only its seeds are this function's.
+    if (e.kind === 'loop') {
+      for (const seed of e.seeds) check(seed, false);
+      return;
+    }
+    for (const child of childrenOf(e)) check(child, false);
+  };
+  check(body, true);
+  const limit = Math.max(LOOP_LIMIT, counterCap(params, body) ?? 0);
+  return { kind: 'loop', params, seeds: params.map(name => ({ kind: 'var', name })), body, limit };
+}
+
+/**
+ * The passes a counted loop asks for: a param that every self-call advances
+ * by one (`k + 1`) and that a case caps with a plain number (`k >= 600: …`)
+ * ends by itself within that many passes from 0, so the default limit need
+ * not cut it short. Capped at LOOP_LIMIT_MAX, like any pixel's work.
+ */
+function counterCap(params: string[], body: Expr): number | undefined {
+  const leaves = loopLeaves(body);
+  const recurs = leaves.filter(isRecur);
+  const conds: Expr[] = [];
+  for (let e = body; e.kind === 'piecewise'; e = e.otherwise ?? { kind: 'num', value: 0 }) {
+    conds.push(...e.cases.map(c => c.cond));
+  }
+  let cap: number | undefined;
+  params.forEach((p, j) => {
+    const isP = (e: Expr) => e.kind === 'var' && e.name === p;
+    const isOne = (e: Expr) => e.kind === 'num' && e.value === 1;
+    const advances = recurs.every(r => {
+      const a = r.args[j];
+      return a?.kind === 'bin' && a.op === '+' && ((isP(a.a) && isOne(a.b)) || (isOne(a.a) && isP(a.b)));
+    });
+    if (!advances || recurs.length === 0) return;
+    for (const c of conds) {
+      if (c.kind !== 'ineq') continue;
+      const n =
+        (c.op === '>=' || c.op === '>') && isP(c.l) && c.r.kind === 'num'
+          ? c.r.value
+          : (c.op === '<=' || c.op === '<') && isP(c.r) && c.l.kind === 'num'
+            ? c.l.value
+            : undefined;
+      // A counter from 0 reaches n on pass n + 1, and one pass more exits.
+      if (n !== undefined && isFinite(n)) cap = Math.max(cap ?? 0, Math.min(LOOP_LIMIT_MAX, Math.ceil(n)) + 2);
+    }
+  });
+  return cap;
+}
+
+/** Whether `e` calls the function being defined. Markers inside an inlined
+ * loop's body belong to that loop, so only its seeds count. */
+const containsRecur = (e: Expr): boolean =>
+  isRecur(e) || (e.kind === 'loop' ? e.seeds.some(containsRecur) : childrenOf(e).some(containsRecur));
+
+export interface StateDef {
+  /** da/dt, resolved. Free vars in {t, constants, states}. */
+  deriv: Expr;
+  /** a at reset, resolved. Free vars in {constants}. */
+  init: Expr;
+}
+
+/** Temporary construction scratch: never returned, retained, or used at runtime.
+ * Only complete validated owners are committed to Env below. */
+interface BindingDraft {
+  sequences: Map<string, SeqScan>;
+  sequencePrefix: string;
+  consts: Map<string, Expr>;
+  fields: Map<string, Expr>;
+  /** `a = e^(iπ/3)`: complex numbers with a name, bound as complex. */
+  complexes: Map<string, Expr>;
+  /** `within = r < R`: inequalities with a name, bound as conditions. */
+  conditions: Map<string, Expr>;
+  fns: Map<string, FnDef>;
+  points: Set<string>;
+  pointDims: Map<string, number>;
+  states: Map<string, StateDef>;
+  vecStates: Map<string, number>;
+  mats: Map<string, Mat>;
+  tensors: Map<string, Tensor>;
+  lists: Map<string, Seq | (Expr & { kind: 'vec' })>;
+  missingData: Map<string, { message: string; list: boolean }>;
+  tables: Map<string, TableDef>;
+  intervals: Map<string, Expr>;
+  multivectors: Map<string, Expr>;
+}
+
+export interface TableDef {
+  file: string;
+  hash: string;
+  data: Table | null;
+  /** Why `data` is null, phrased for wherever this ran. */
+  missing?: string;
+}
+
+const emptyDraft = (): BindingDraft => ({
+  consts: new Map(),
+  fns: new Map(),
+  fields: new Map(),
+  complexes: new Map(),
+  conditions: new Map(),
+  sequences: new Map(),
+  sequencePrefix: 'eqioSeq',
+  points: new Set(),
+  pointDims: new Map(),
+  states: new Map(),
+  vecStates: new Map(),
+  mats: new Map(),
+  tensors: new Map(),
+  lists: new Map(),
+  missingData: new Map(),
+  tables: new Map(),
+  intervals: new Map(),
+  multivectors: new Map(),
+});
+
+/**
+ * Rows one data file may plot. A column reaches the renderer as its own
+ * Float64Array with nothing to evaluate per point, so this is now a drawing
+ * limit rather than an expression one — a much higher ceiling. Combining a
+ * column with t, a slider, or a comparison still expands it to one
+ * expression per row, and list.ts caps that separately (ITEMS_MAX).
+ */
+export const TABLE_MAX_ROWS = 200_000;
+
+/**
+ * Thrown when a row needs data this device does not have. The web app turns
+ * it into "drop the file here"; the server-side preview reports the row as
+ * device-local rather than broken, because it is not the graph that is wrong.
+ */
+export class MissingDataError extends Error {}
+
+/** Row positions, built once per table (and so shared by every row asking). */
+const tablePositions = new WeakMap<Table, Float64Array>();
+function positions(table: Table): Float64Array {
+  let hit = tablePositions.get(table);
+  if (!hit) tablePositions.set(table, (hit = rowPositions(table)));
+  return hit;
+}
+
+/** Expression elements of a numeric column, built once per parsed column. */
+/** Character counts are stable for a parsed column, including filtered copies. */
+const colLengths = new WeakMap<Column, Float64Array>();
+
+function textLengths(col: Column): Float64Array {
+  let values = colLengths.get(col);
+  if (!values) {
+    values = Float64Array.from(col.strs!, text => {
+      // CSV blanks are missing values, not empty strings to count as zero.
+      if (!text) return NaN;
+      let length = 0;
+      for (const _char of text) length++; // Unicode code points, not UTF-16 units
+      return length;
+    });
+    colLengths.set(col, values);
+  }
+  return values;
+}
+
+/**
+ * `P.x`, `P.y`, `P.z` of a named point list: the list of that coordinate,
+ * over P's own instances — so `(P.x, P.y - (m P.x + b))` and
+ * `P.y ~ m P.x + b` pair up point by point, the way a data file's columns
+ * do. (Two separately written lists `X`, `Y` are independent and cross.)
+ */
+function pointColumn(defs: ValueDefinitions, name: string, axis: string): Seq | null {
+  // A tuple of two 2D points — three 3D ones — is a matrix; its rows are
+  // the same points.
+  const mat = defs.mats.get(name);
+  const points = mat ? rowsAsPoints(mat, name) : defs.lists.get(name);
+  if (!points || points.kind !== 'list') return null;
+  const k = ['x', 'y', 'z'].indexOf(axis);
+  const dims = new Set(points.items.map(p => (p.kind === 'vec' ? p.items.length : 0)));
+  if (!points.items.length || dims.has(0)) {
+    throw new Error(`${name}.${axis} reads a coordinate of a list of points; ${name} is a list of numbers.`);
+  }
+  const dim = Math.min(...dims);
+  if (k < 0 || k >= dim) {
+    throw new Error(
+      `${name} is a list of ${dim}D points: its coordinates are ${['x', 'y', 'z']
+        .slice(0, dim)
+        .map(c => `${name}.${c}`)
+        .join(', ')}.`,
+    );
+  }
+  return withAxes(
+    { kind: 'list', items: points.items.map(p => (p as Expr & { kind: 'vec' }).items[k]) },
+    namedAxes(name, points),
+  );
+}
+
+/**
+ * Resolve a name to a tensor: a named tensor, or — asked with `tuples`, by an
+ * operation on tensors — a named tuple, which is one too: a tuple of numbers
+ * a vector, a tuple of points a rank-2 tensor (docs/multisets.md §3: the
+ * consumer decides the reading).
+ */
+export function tensorGetter(defs: ValueDefinitions): GetTensor {
+  return (name, tuples) => {
+    const hit = defs.tensors.get(name);
+    if (hit || !tuples) return hit ?? null;
+    const list = defs.lists.get(name);
+    if ((list?.kind !== 'list' && list?.kind !== 'data') || !isTuple(list) || axesOf(list).length !== 1) return null;
+    // A tuple of numbers is a vector of any length: T = sort(L).
+    if (list.kind === 'data') return vectorTensor([...list.values].map(value => ({ kind: 'num', value })));
+    if (list.items.every(it => it.kind !== 'vec' && it.kind !== 'list')) return vectorTensor(list.items);
+    const rows = list.items.map(it => (it.kind === 'vec' ? vectorTensor(it.items) : null));
+    return rows.length && rows.every(r => r !== null) ? stack(rows as Tensor[]) : null;
+  };
+}
+
+/**
+ * Resolve a name to list elements: a named list, or a data column written
+ * `table.column`. Throws (rather than returning null) when the name clearly
+ * means a column but cannot produce one, so the row explains itself.
+ */
+export function listGetter(defs: ValueDefinitions): GetList {
+  return name => {
+    const hit = defs.lists.get(name);
+    if (hit) return hit;
+    // Any name whose definition wanted an absent file reports the file —
+    // being a list or not decides how the name PARSES (indexing, filters),
+    // not whether a row using it gets a straight answer. Without this
+    // `avg = mean(person.age)` then `avg + 1` says "unknown variable".
+    const absent = defs.missingData.get(name);
+    if (absent) throw new MissingDataError(absent.message);
+    const dot = name.indexOf('.');
+    if (dot <= 0) {
+      // A data file is not a value on its own: it is where columns live.
+      const bare = defs.tables.get(name);
+      if (!bare) return null;
+      const col = bare.data?.columns.find(c => c.type === 'num')?.name;
+      throw new Error(
+        `${name} is a data file — plot one of its columns${col ? `, like ${name}.${col}` : ''},` +
+          ` or name a filtered copy: adults = ${name}[…].`,
+      );
+    }
+    const table = defs.tables.get(name.slice(0, dot));
+    if (!table) return pointColumn(defs, name.slice(0, dot), name.slice(dot + 1));
+    const path = name.slice(dot + 1);
+    const length = path.endsWith('.length');
+    const col = length ? path.slice(0, -'.length'.length) : path;
+    if (!table.data) throw new MissingDataError(table.missing ?? `${table.file} is not loaded.`);
+    const found = table.data.columns.find(c => c.name === col);
+    // Every row's position in the file: `person.row` (docs/multisets.md §3).
+    if (!found && !length && col === positionColumn(table.data)) {
+      return withAxes({ kind: 'data', values: positions(table.data) }, [
+        { id: `${name.slice(0, dot)}.`, n: table.data.rows },
+      ]);
+    }
+    if (!found) {
+      throw new Error(
+        `${table.file} has no column "${col}" (columns: ${table.data.columns.map(c => c.name).join(', ')}).`,
+      );
+    }
+    // Every column of one file runs over the same instances — its rows — so
+    // (person.age, person.height) pairs up however the columns are combined.
+    const rows = [{ id: `${name.slice(0, dot)}.`, n: table.data.rows }];
+    if (length) {
+      if (found.type !== 'str') {
+        throw new Error(`${name} counts characters — ${name.slice(0, -'.length'.length)} is a numeric column.`);
+      }
+      if (table.data.rows > TABLE_MAX_ROWS) {
+        throw new Error(`${table.file} has ${table.data.rows} rows; plotting is limited to ${TABLE_MAX_ROWS}.`);
+      }
+      return withAxes({ kind: 'data', values: textLengths(found) }, rows);
+    }
+    // A text column is a list too — of text. Only comparisons accept one
+    // (list.ts); everything numeric says so where it is used.
+    if (found.type !== 'num') return withAxes({ kind: 'text', values: found.strs! }, rows);
+    if (table.data.rows > TABLE_MAX_ROWS) {
+      throw new Error(`${table.file} has ${table.data.rows} rows; plotting is limited to ${TABLE_MAX_ROWS}.`);
+    }
+    // The column's own array, never mutated downstream: every operation in
+    // list.ts allocates its result.
+    return withAxes({ kind: 'data', values: found.nums! }, rows);
+  };
+}
+
+/** Every name that reads as a list, so `L[2]`, `person.age[2]` and
+ *  `person[…]` index instead of multiplying (parseExpr needs this before it
+ *  parses). Table names count: a data file is indexed by a filter. */
+export function listNamesOf(defs: ValueDefinitions): Set<string> {
+  const out = new Set([
+    ...defs.mats.keys(),
+    ...defs.tensors.keys(),
+    ...defs.lists.keys(),
+    ...[...defs.sequences.keys()].map(n => n + '_'),
+  ]);
+  // A list whose file is elsewhere still indexes: the row must parse the same
+  // way on every device (see `indexes` in expr.ts).
+  for (const [name, m] of defs.missingData) if (m.list) out.add(name);
+  for (const [name, t] of defs.tables) {
+    out.add(name);
+    for (const c of t.data?.columns ?? []) out.add(`${name}.${c.name}`);
+    const row = t.data && positionColumn(t.data);
+    if (row) out.add(`${name}.${row}`);
+  }
+  return out;
+}
+
+/** Every name that `name[k]` indexes when parsing: the lists, and named
+ *  points, which are tuples of 2 or 3 numbers (T[2]; docs/multisets.md §3)
+ *  but are not lists anywhere else. */
+export function indexNamesOf(defs: ValueDefinitions): Set<string> {
+  return new Set([...listNamesOf(defs), ...defs.pointDims.keys()]);
+}
+
+/**
+ * Whether a name reads as a list — what `d/dx L` asks before it differentiates.
+ *
+ * A dotted path counts when its HEAD is known, not only the full path: without
+ * the bytes there is no column list to enumerate, and answering "no" there
+ * made `d/dx person.age` refuse on the author's device and quietly answer 0
+ * in the same graph shared, previewed, or read through the MCP server. Same
+ * rule, and the same reason, as `indexes` in expr.ts.
+ */
+export const isListName = (names: ReadonlySet<string>, n: string): boolean => {
+  if (names.has(n)) return true;
+  const dot = n.indexOf('.');
+  return dot > 0 && names.has(n.slice(0, dot));
+};
+
+/**
+ * Of the names a document binds as values, the ones the language would
+ * otherwise claim — what parseExpr needs to keep `total = 3` followed by
+ * `total(x + 1)` the product it was before `total` became a reduction, and to
+ * read `e` after `e := 0.6` (or in the body of `f(e) := …`) as that e.
+ *
+ * Folded through `builtinFn`, because that is how a call is read: `Total = 3`
+ * is a legal definition and `Total(x + 1)` folds to the `total` builtin, so
+ * only the folded name says which builtin this document has taken.
+ */
+export const shadowedNames = (names: Iterable<string>): Set<string> => {
+  const out = new Set<string>();
+  for (const n of names) {
+    // A redefined built-in (`e := 0.6`, or a parameter named e) is bound by
+    // its alias; every row of its scope reads the written name as that alias.
+    if (n !== writtenName(n)) out.add(writtenName(n));
+    const b = builtinFn(n);
+    if (b && SHADOWABLE_FNS.has(b)) out.add(b);
+  }
+  return out;
+};
+
+/**
+ * Whether a name is already spoken for — what a `~` row asks before claiming
+ * one. Shared by the app and the worker because it drifted while it was
+ * written out twice, and because it must answer the same on both.
+ *
+ * `missingData` counts. A definition whose file is absent still claims its
+ * name — that is why rows below it report the file rather than "not defined"
+ * — so leaving it out would let `ages ~ Normal(0, 1)` stand next to
+ * `ages = person.age / 2` in a shared link and be rejected as "already
+ * defined" by the one person who has the CSV.
+ */
+const draftNameTaken = (defs: ValueDefinitions, n: string): boolean =>
+  defs.consts.has(n) ||
+  defs.fns.has(n) ||
+  defs.fields.has(n) ||
+  defs.complexes.has(n) ||
+  defs.conditions.has(n) ||
+  defs.states.has(n) ||
+  defs.points.has(n) ||
+  defs.mats.has(n) ||
+  defs.tensors.has(n) ||
+  defs.multivectors.has(n) ||
+  defs.lists.has(n) ||
+  defs.tables.has(n) ||
+  defs.missingData.has(n);
+
+/**
+ * Whether this side of a comparison is still a list by the time the
+ * comparison sees it — the question list.ts answers by lowering, asked here
+ * of the shape alone, because on a device without the bytes there is nothing
+ * to lower. Arithmetic and scalar functions map over a list; a reduction or
+ * an index collapses one, and `[ ]` is itself a filter.
+ */
+function staysList(e: Expr, defs: ValueDefinitions): boolean {
+  switch (e.kind) {
+    case 'var': {
+      if (defs.lists.has(e.name) || defs.missingData.get(e.name)?.list === true) return true;
+      const dot = e.name.indexOf('.');
+      if (dot <= 0) return false;
+      // `P.x` of a point list, or of the rows of a matrix.
+      const head = e.name.slice(0, dot);
+      return defs.tables.has(head) || defs.lists.has(head) || defs.mats.has(head);
+    }
+    case 'list':
+    case 'data':
+    case 'text':
+      return true;
+    case 'neg':
+      return staysList(e.a, defs);
+    case 'bin':
+      return staysList(e.a, defs) || staysList(e.b, defs);
+    case 'call':
+      // A reduction answers with one number however long its argument is,
+      // and `[at]`/`[index]` pick one element out.
+      if (SCALAR_REDUCTIONS.has(e.name)) return false;
+      if ((e.name === 'min' || e.name === 'max') && e.args.length === 1) return false;
+      // hist is a whole plot, not a value — list.ts refuses it in a filter
+      // once the bytes are here, so it must not look list-shaped before then.
+      if (e.name === 'hist') return false;
+      return e.args.some(a => staysList(a, defs));
+    case 'vec':
+      return e.items.some(a => staysList(a, defs));
+    default:
+      return false;
+  }
+}
+
+/**
+ * What a filter can be judged without reading a single row: that it is a
+ * comparison over a list, and that it could ever settle. Everything else —
+ * which rows it keeps, how many there are — needs the file (list.ts decides
+ * those). The two answers must agree, or a shared link is valid only on the
+ * device that has the bytes.
+ */
+/** A mask is a list of comparisons, so a filter condition has to BE one:
+ *  `person[5]`, `person[person.age]`, `person[sin(person.age)]` are values. */
+const isComparison = (e: Expr): e is Expr & { kind: 'ineq' | 'eqtest' } => e.kind === 'ineq' || e.kind === 'eqtest';
+
+/** A comparison that decides the same answer for every element is not a
+ *  filter, whatever it mentions — `L[1 < 2]`, `L[mean(L) > 0]`, `L[L[1] > 0]`. */
+const DEAD_FILTER =
+  'A filter has to test the list itself, like L[L > 2]' + ' — this one answers the same for every element.';
+
+/**
+ * What is wrong with the index in `L[idx]`, judged by shape alone — or null.
+ * The other half of the `[…]` syntax from checkFilterShape below, and the same
+ * reasoning: list.ts settles these by lowering, which needs the bytes, and a
+ * question answered only where the file is makes a link valid on one device
+ * and broken on the next. So `person.age[1 < 2]` is a dead filter everywhere,
+ * rather than reported as merely device-local in a shared link and refused
+ * for the author. (A list of indices picks elements, so it is no issue here.)
+ */
+export function indexIssue(idx: Expr, defs: ValueDefinitions, target?: Expr): string | null {
+  const inside = wholePlotOverList(idx, defs);
+  if (inside) return `Lists cannot appear inside ${inside}(…).`;
+  if (!isComparison(idx)) {
+    // A column is a multiset whether or not its file is here, so picking by
+    // position is refused on every device alike (docs/multisets.md §3).
+    const name = target?.kind === 'var' ? target.name : '';
+    const dot = name.indexOf('.');
+    return dot > 0 && defs.tables.has(name.slice(0, dot)) ? orderMessage(name, idx, false) : null;
+  }
+  const operands = idx.kind === 'ineq' ? ineqComparisons(idx).flatMap(c => [c.l, c.r]) : idx.args;
+  return operands.some(a => staysList(a, defs)) ? null : DEAD_FILTER;
+}
+
+/**
+ * A whole-plot form with a list inside it — `domain(person.age)`, and the
+ * geometry statements — named as list.ts names it when the bytes are here.
+ * Answered from the shape alone, so `person[domain(person.age) > 0]` is
+ * refused on the device that cannot lower it as well as on the one that can.
+ */
+function wholePlotOverList(e: Expr, defs: ValueDefinitions): string | null {
+  if (e.kind === 'call') {
+    if (NO_LIST_INSIDE.has(e.name) && e.args.some(a => staysList(a, defs))) {
+      return plainFnName(e.name);
+    }
+    for (const a of e.args) {
+      const hit = wholePlotOverList(a, defs);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  const kids = childrenOf(e);
+  for (const k of kids) {
+    const hit = wholePlotOverList(k, defs);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function checkFilterShape(cond: Expr, defs: ValueDefinitions, shape: string): void {
+  if (!isComparison(cond)) throw new Error(shape);
+  const inside = wholePlotOverList(cond, defs);
+  if (inside) throw new Error(`Lists cannot appear inside ${inside}(…).`);
+  // …and a list has to REACH it. Merely mentioning one is not enough:
+  // `person[mean(person.age) > 0]` and `person[person.age[1] > 0]` reduce to a
+  // single scalar, so they decide one answer for every row — `person[1 < 2]`
+  // wearing a column's name. Only operations that map over a list keep it one.
+  const operands = cond.kind === 'ineq' ? ineqComparisons(cond).flatMap(c => [c.l, c.r]) : cond.args;
+  if (!operands.some(a => staysList(a, defs))) throw new Error(shape);
+  if (freeVars(cond).has('t')) {
+    throw new Error('A filter cannot depend on t — the list would change length every frame.');
+  }
+}
+
+/**
+ * A definition that filters a whole data file: `adults = person[cond]`.
+ * Recognized before list lowering, which knows only about values — the
+ * result is a new table, with every column cut to the rows the mask keeps.
+ * Returns null when the row is not that shape.
+ */
+function filteredTable(e: Expr, defs: ValueDefinitions, opts: ResolveOpts): TableDef | null {
+  if (e.kind !== 'index' || e.args[0]?.kind !== 'var') return null;
+  const src = defs.tables.get(e.args[0].name);
+  if (!src) return null;
+  const name = e.args[0].name;
+  const shape = `${name}[…] needs a comparison, like ${name}[${name}.x > 0].`;
+  // Judged by shape on every device first, so a filter the bytes would
+  // refuse for another reason (an index inside it) says the same everywhere.
+  checkFilterShape(e.args[1], defs, shape);
+  // No bytes to cut (a shared link elsewhere, or a server-side preview): the
+  // cut is a table too, and reports the same reason its source does. Only the
+  // per-row answer waits for the data — whether the row is a filter at all,
+  // and whether it could ever settle, are answered here either way, or a
+  // shared link would call `person[5]` valid and the author's device would not.
+  if (!src.data) {
+    return { file: src.file, hash: src.hash, data: null, missing: src.missing };
+  }
+  const keep = lowerMask(e.args[1], listGetter(defs), opts);
+  if (!keep) throw new Error(shape);
+  if (keep.length !== src.data.rows) {
+    throw new Error(`The filter tests ${keep.length} values but ${src.file} has ${src.data.rows} rows.`);
+  }
+  return { file: src.file, hash: src.hash, data: filterTable(src.data, keep) };
+}
+
+/** Component names `name` expands to under geometry lowering, or null. */
+export const compsOf = (defs: ValueDefinitions, name: string): readonly string[] | null => {
+  if (defs instanceof Env) {
+    const value = lowerValueRef(defs, name);
+    return value.kind === 'vec' ? value.items.map(e => (e as Expr & { kind: 'var' }).name) : null;
+  }
+  return defs.points.has(name)
+    ? pointComps(name, defs.pointDims.get(name))
+    : defs.vecStates.has(name)
+      ? vecStateComps(name, defs.vecStates.get(name)!)
+      : null;
+};
+
+/** Synthetic field names of named vectors (`s_x`, `s_y` for `s = (x, y)`).
+ *  They substitute like coordinate fields but are not user-written grids. */
+export const pointComponentNames = (defs: ValueDefinitions): Set<string> => {
+  const out = new Set<string>();
+  for (const p of defs.points) {
+    for (const c of pointComps(p, defs.pointDims.get(p))) out.add(c);
+  }
+  return out;
+};
+
+/**
+ * Names with built-in meaning that definitions may not shadow.
+ *
+ * `open` is deliberately NOT one of them, common as it is in data (a price
+ * series names a column that). A row is a data file because of its SHAPE —
+ * `name = open("file.csv")`, matched before the function and constant forms —
+ * so a graph that says `open = 3` keeps the slider it was shared with, and a
+ * graph that says `open(f) = f` keeps its function; only the quoted-file-name
+ * shape belongs to the data syntax.
+ */
+export const RESERVED = new Set(['x', 'y', 'z', 'u', 'v', 't', 'w', 'i', 'd', 'e', 'pi']);
+
+const FN_RE = new RegExp(
+  String.raw`^\s*(${NAME_SRC})\s*\(\s*(${NAME_SRC}(?:\s*,\s*${NAME_SRC})*)\s*\)\s*=(?!=)([\s\S]+)$`,
+);
+const CONST_RE = new RegExp(String.raw`^\s*(${NAME_SRC})\s*=(?!=)([\s\S]+)$`);
+/** A right side that may define u or v (`u = interval(0, 2pi)`); resolution
+ *  checks it is an interval and nothing else. */
+const INTERVAL_RHS_RE = /\binterval\s*\(/i;
+/** `p ∈ A` (or `p \in A`): a binder, a draw from A. */
+const DRAW_RE = new RegExp(String.raw`^\s*(${NAME_SRC})\s*${DRAW_OP_SRC}\s*([\s\S]+)$`);
+const STATE_RE = new RegExp(String.raw`^\s*(${NAME_SRC})'\s*=(?!=)([\s\S]+)$`);
+const INIT_RE = new RegExp(String.raw`^\s*(${NAME_SRC})\s*\(\s*0\s*\)\s*=(?!=)([\s\S]+)$`);
+/**
+ * `person = open("people.csv", 3a7f9c…)` — the hash is optional as typed;
+ * the app fills it in from the file it finds (like a slider's write-back).
+ *
+ * At least `HASH_TOKEN_LEN` hex digits, because a row is resolved by hash
+ * *prefix*: a shorter token can match more than one stored file, and binding
+ * a row to the wrong bytes is the exact failure the pin exists to prevent.
+ */
+const TABLE_RE = new RegExp(
+  String.raw`^\s*(${NAME_SRC})\s*=\s*open\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*(?:,\s*([0-9a-fA-F]{${HASH_TOKEN_LEN},64})\s*)?\)\s*$`,
+);
+
+/**
+ * The name a file is stored and written under. A row quotes the file name
+ * with no escape (`open("sales.csv")`), so a name holding a quote or a line
+ * break could not be read back — and a row that cannot be read back is worse
+ * than one whose title lost a character. Applied at ingest, so what is stored
+ * and what the row says are the same string, and re-dropping the file matches.
+ *
+ * `;` used to go the same way, because the link codec could not tell a data
+ * semicolon from the separator between rows; now it can (lib/link.ts), so
+ * `sales;2026.csv` keeps its name.
+ */
+export const rowSafeFileName = (name: string): string => name.replace(/["\r\n\t]+/g, '_').trim() || 'data.csv';
+
+/** A row that means to open a file, whether or not it succeeds at saying so. */
+const OPEN_HEAD_RE = new RegExp(String.raw`^\s*(${NAME_SRC})\s*=\s*open\s*\(\s*["']`);
+
+/** How an `open(…)` row is written, for the app's write-back. */
+export const formatTableRow = (name: string, file: string, hash: string): string =>
+  `${name} = open("${rowSafeFileName(file)}"${hash ? `, ${shortHash(hash)}` : ''})`;
+
+/**
+ * A row that means to open a file but cannot: it claims a name it may not
+ * have (`w`, `e`, `open` itself), or pins a hash too short to identify one
+ * file. Without this it falls through to the expression parser, which only
+ * knows that quotes are not arithmetic.
+ */
+export function badTableRow(text: string): string | null {
+  text = asAssignment(text);
+  const m = OPEN_HEAD_RE.exec(text);
+  if (!m) return null;
+  if (!nameable(m[1])) {
+    return `${m[1]} is a built-in name, so it cannot name a data file — try ${m[1]}_data = open(…).`;
+  }
+  if (TABLE_RE.test(text)) return null;
+  const short = /,\s*([0-9a-fA-F]+)\s*\)\s*$/.exec(text);
+  if (short && short[1].length < HASH_TOKEN_LEN) {
+    return (
+      `A data file's hash is ${HASH_TOKEN_LEN} hex digits; that is ${short[1].length}.` +
+      ' Delete it and the app will fill in the right one.'
+    );
+  }
+  // Something else malformed. scanDefinition hands every open-shaped row here
+  // rather than reading it as a constant, so this is the only explanation the
+  // row will get — the expression parser only knows quotes are not arithmetic.
+  return (
+    `A data file row reads ${m[1]} = open("file.csv")` +
+    `, with an optional ${HASH_TOKEN_LEN}-digit hash after the name.`
+  );
+}
+
+/** A name a definition may claim: not a builtin (except the late-addition
+ *  ones old graphs may define themselves), not reserved, not a uniform. */
+export const nameable = (n: string): boolean =>
+  (!FUNCTIONS.has(n) || SHADOWABLE_FNS.has(n)) && !RESERVED.has(n) && !n.startsWith('u_');
+
+/** A row written `name := …` (or `f(x) := …`, `a' := …`): explicitly a definition. */
+export const isExplicitDefinition = (text: string): boolean => explicitAssignment(text) !== null;
+
+/** The row with its `:=` read as `=`, for the scanners that match a row's
+ *  shape (definitions, data files, random variables) — the same row either way. */
+export function asAssignment(text: string): string {
+  const at = explicitAssignment(text);
+  return at ? `${text.slice(0, at[0])}=${text.slice(at[1])}` : text;
+}
+
+/** A written name as a definition binds it: a redefined built-in (or
+ *  parameter) by its alias, so it reads as what parses there (REDEFINABLE). */
+const bindable = (name: string): string => (REDEFINABLE.has(name) ? reboundName(name) : name);
+
+/**
+ * A definable name for a dropped file, starting from the one its file name
+ * suggests: the stem itself where a definition may claim it, `data_…` where it
+ * may not, then numbered until nothing else has taken it.
+ *
+ * Both halves matter, because numbering alone cannot rescue every stem: no
+ * `u_2`, `u_3`, … is nameable either (they all read as uniforms), so `u.csv`
+ * sent the search for a free name round forever and froze the tab — after the
+ * bytes were already stored. `data_u` is nameable, and so is every number
+ * after it.
+ */
+export function freeTableName(base: string, taken: ReadonlySet<string>): string {
+  const stem = nameable(base) ? base : `data_${base}`;
+  if (!taken.has(stem)) return stem;
+  for (let k = 2; ; k++) {
+    const name = `${stem}_${k}`;
+    if (!taken.has(name)) return name;
+  }
+}
+
+/** Detect a definition row before parsing (so calls to it parse everywhere). */
+/** A subscript written in braces, as a recurrence row is: `a_{0} = 1` defines
+ *  a_0 (the seed), `T_{c} = 300` defines T_c. Parens only around a number:
+ *  `f_(x) = …` is a function. */
+const BRACED_TERM_RE = new RegExp(
+  `^(\\s*[A-Za-z${GREEK_NAME_CHARS}])_(?:\\{\\s*(\\d+|[A-Za-z${GREEK_NAME_CHARS}]\\w*)\\s*\\}|\\(\\s*(\\d+)\\s*\\))(?=\\s*=(?!=))`,
+);
+
+export function scanDefinition(text: string): Definition | null {
+  // `a := …` says outright what `a = …` leaves to the name: this is a
+  // definition, so it may claim e, i, w, pi or t too.
+  const explicit = isExplicitDefinition(text);
+  text = asAssignment(text);
+  const claimable = (n: string): boolean => nameable(n) || (explicit && REDEFINABLE.has(n));
+  text = text.replace(
+    BRACED_TERM_RE,
+    (_, head: string, braced?: string, paren?: string) => `${head}_${braced ?? paren}`,
+  );
+  // Captured names canonicalize (T₀ → T_0) so a definition binds the same
+  // name the tokenizer reads in expressions — a redefined built-in's alias.
+  const written = (m: RegExpExecArray): string => canonicalName(m[1]);
+  const name = (m: RegExpExecArray): string => bindable(written(m));
+  // Primes first: `a' = …` is a state, but the reserved coordinate names keep
+  // their ODE meaning, so `y' = x - y` stays a slope field (see plot.ts).
+  let m = STATE_RE.exec(text);
+  if (m && claimable(written(m))) return { kind: 'state', name: name(m), rhs: m[2] };
+  m = INIT_RE.exec(text);
+  if (m && claimable(written(m))) return { kind: 'init', name: name(m), rhs: m[2] };
+  // Before the function form: `open(…)` takes a file name, not parameters.
+  m = TABLE_RE.exec(text);
+  if (m && claimable(written(m))) {
+    return { kind: 'table', name: name(m), file: m[2] ?? m[3], hash: (m[4] ?? '').toLowerCase() };
+  }
+  // A row that plainly means to open a file but does not parse as one is NOT
+  // a constant: `p = open("a.csv", abc123)` would otherwise be scanned as a
+  // definition, and the row validator — the only thing that can explain the
+  // short hash — never runs on definition rows. Leave it to badTableRow.
+  if (OPEN_HEAD_RE.test(text)) return null;
+  m = FN_RE.exec(text);
+  // Only as a value: the parser reads `e(2)` as e · 2 wherever e is not the
+  // document's value, so `e(x) := …` would define a function no row calls.
+  if (m && nameable(written(m))) {
+    return {
+      kind: 'fn',
+      name: name(m),
+      params: m[2].split(/\s*,\s*/).map(p => bindable(canonicalName(p))),
+      rhs: m[3],
+    };
+  }
+  m = CONST_RE.exec(text);
+  if (m && claimable(written(m))) return { kind: 'const', name: name(m), rhs: m[2] };
+  // `u = interval(0, 2pi)` sets the range u runs over, (0, 1) by default.
+  if (m && PARAMS.has(written(m)) && INTERVAL_RHS_RE.test(m[2])) return { kind: 'const', name: name(m), rhs: m[2] };
+  m = DRAW_RE.exec(text);
+  if (m && claimable(written(m))) return { kind: 'const', name: name(m), rhs: m[2], draw: true };
+  return null;
+}
+
+/** A definition row's left side and assignment as the row wrote them, for
+ *  writing it back (`e :=`, `a(0) =`): a slider or drag keeps `:=` and the
+ *  written name, never the alias. */
+export const definitionHead = (def: Definition, text: string): string =>
+  `${writtenName(def.name)}${def.kind === 'init' ? '(0)' : ''} ${isExplicitDefinition(text) ? ':=' : '='}`;
+
+/** Why a row that reads as a binder, `p ∈ A` (or `\\in`), binds no
+ *  name: the name is the language's. Null when it is not such a row. */
+export function takenBinder(text: string, valueNames: ReadonlySet<string> = new Set()): string | null {
+  const m = DRAW_RE.exec(text);
+  const n = canonicalName(m?.[1] ?? '');
+  if (!m || nameable(n)) return null;
+  // After `i := 3`, i is the document's, defined once already.
+  if (REDEFINABLE.has(n) && valueNames.has(n)) return `${n} is already defined.`;
+  const why = n.startsWith('u_')
+    ? 'names starting u_ are'
+    : FUNCTIONS.has(n)
+      ? `${m[1]} is a built-in function`
+      : 'x, y, z, t, u, v, w, d, e, i and pi are';
+  return `${m[1]} is taken by the language, so it cannot be drawn: ${why}. Draw with another name, like p ∈ A.`;
+}
+
+/**
+ * The name a row tried to define when that name is taken by the language:
+ * `e = 0.6` or `d(x) = …` look like a slider or a function but are not one,
+ * since `d` starts `d/dx`, `e` and `pi` are constants and `i` is the
+ * imaginary unit. Such a row still means what it says (`e = 2` is a false
+ * claim, and says so); this is only for explaining why no slider appeared.
+ */
+export function takenDefinitionName(text: string): 'd' | 'e' | 'pi' | 'i' | null {
+  const m = FN_RE.exec(text) ?? CONST_RE.exec(text);
+  const n = m && canonicalName(m[1]);
+  return n === 'd' || n === 'e' || n === 'pi' || n === 'i' ? n : null;
+}
+
+/** What each name a function row cannot claim already means. */
+const RESERVED_FN_MEANING: Record<string, string> = {
+  x: 'a plot axis',
+  y: 'a plot axis',
+  z: 'a plot axis',
+  t: 'animation time',
+  u: 'a curve/surface parameter',
+  v: 'a curve/surface parameter, like u',
+  w: 'the complex variable x + iy',
+};
+
+/**
+ * Why a row shaped like a function definition on a reserved name failed:
+ * `u(x, y) = x^2 + y^2` is not a definition (u is a parameter), so the
+ * parser reads u·(x, y) and reports "One side is a point and the other is a
+ * number". AI assistants reach for u, v and w as helper names. The product
+ * reading is legitimate — `x(y - 1) = 1` is x·(y − 1) = 1 — so the hint
+ * states that reading rather than assuming a definition was meant, and is
+ * only consulted for a row that already failed: no working graph changes.
+ */
+export function reservedFnHint(text: string): string | null {
+  const m = FN_RE.exec(text);
+  const n = m && canonicalName(m[1]);
+  if (!n || !(n in RESERVED_FN_MEANING)) return null;
+  const args = m![2];
+  return `${n}(${args}) reads as ${n} times (${args}), since ${n} is ${RESERVED_FN_MEANING[n]}. To define a function, use another name, like f(${args}) = …`;
+}
+
+/** Why a name from takenDefinitionName (other than `d`) names no value. */
+export function takenNameHint(name: string): string {
+  return name === 'i'
+    ? 'i is the imaginary unit; name it something else, like k (i := … replaces it across the whole graph)'
+    : `${name} is a constant; name a slider something else, like k (${name} := … replaces ${name} across the whole graph)`;
+}
+
+/**
+ * Why a `:=` row defines nothing: it claims a name the language keeps even
+ * from an explicit definition (REDEFINABLE says which it gives up), or its
+ * left side names nothing. Null for a row that is no `:=`, or defines.
+ */
+export function explicitDefinitionError(text: string): string | null {
+  if (!isExplicitDefinition(text) || scanDefinition(text)) return null;
+  if (badTableRow(text)) return null;
+  const row = asAssignment(text);
+  const fn = FN_RE.exec(row);
+  const m = fn ?? CONST_RE.exec(row) ?? STATE_RE.exec(row);
+  const n = m && canonicalName(m[1]);
+  if (!n) return 'The left side of := names what it defines, like a := 2 or f(x) := x^2.';
+  if (fn && REDEFINABLE.has(n)) return `${n} can be redefined as a value, not a function.`;
+  const why =
+    n === 'd'
+      ? 'd starts derivatives (d/dx)'
+      : n in RESERVED_FN_MEANING
+        ? `${n} is ${RESERVED_FN_MEANING[n]}`
+        : n.startsWith('u_')
+          ? 'names starting u_ are kept for sliders'
+          : `${n} is a built-in function`;
+  if (PARAMS.has(n))
+    return `${n} is ${RESERVED_FN_MEANING[n]}, so it is redefined as the interval it runs over, like ${n} := interval(0, 2pi).`;
+  const params = SPACE.has(n) ? ` A function's parameters may still be called ${n}, like f(${n}) := ${n}^2.` : '';
+  return `${n} cannot be redefined: ${why}.${params}`;
+}
+
+export type GetFn = (name: string) => FnDef | undefined;
+
+/** A differential's name: d and one letter, Latin or Greek (dx, dθ, dτ). */
+const D_VAR = new RegExp(`^d[A-Za-z${GREEK_NAME_CHARS}]$`);
+export const dVarName = (n: Expr): string | null => (n.kind === 'var' && D_VAR.test(n.name) ? n.name.slice(1) : null);
+
+/** Match `d` or `d^k` (the numerator of a Leibniz derivative). */
+function dOrder(n: Expr): number | null {
+  if (n.kind === 'var' && n.name === 'd') return 1;
+  if (
+    n.kind === 'bin' &&
+    n.op === '^' &&
+    n.a.kind === 'var' &&
+    n.a.name === 'd' &&
+    n.b.kind === 'num' &&
+    Number.isInteger(n.b.value) &&
+    n.b.value >= 1 &&
+    n.b.value <= 6
+  ) {
+    return n.b.value;
+  }
+  return null;
+}
+
+/** Match `dx` or `dx^k`, yielding the variable and order. */
+function dxOrder(n: Expr): { v: string; order: number } | null {
+  let v = dVarName(n);
+  if (v) return { v, order: 1 };
+  if (
+    n.kind === 'bin' &&
+    n.op === '^' &&
+    (v = dVarName(n.a)) &&
+    n.b.kind === 'num' &&
+    Number.isInteger(n.b.value) &&
+    n.b.value >= 1 &&
+    n.b.value <= 6
+  ) {
+    return { v, order: n.b.value };
+  }
+  return null;
+}
+
+/** Numerator forms: d(^k), -d(^k), C·d(^k). */
+function numeratorWrap(n: Expr): { order: number; wrap: (x: Expr) => Expr } | null {
+  let order = dOrder(n);
+  if (order !== null) return { order, wrap: x => x };
+  if (n.kind === 'neg' && (order = dOrder(n.a)) !== null) return { order, wrap: neg };
+  if (n.kind === 'bin' && n.op === '*' && (order = dOrder(n.b)) !== null) {
+    const c = n.a;
+    return { order, wrap: x => mul(c, x) };
+  }
+  return null;
+}
+
+/** Step for the central-difference fallback. Balances truncation against
+ *  float32 roundoff — plots evaluate the expanded expression on the GPU. */
+const FD_H = 1e-4;
+
+export function applyDiff(e: Expr, v: string, order: number, opts?: ResolveOpts, getFn?: GetFn): Expr {
+  const isList = opts?.isList;
+  e = throughFields(e, opts);
+  // A list is still just a name at this point, and diff() treats an unknown
+  // name as a constant — so differentiating one would answer 0 for every
+  // element. Elements may only use constants, states, and t, so that is
+  // right for x, y, and z (d/dx x^N with N a list) and wrong for the rest:
+  // say it cannot be done rather than answer wrongly.
+  const list = !SPACE.has(v) && isList && [...freeVars(e)].find(isList);
+  if (list) {
+    throw new Error(
+      `${list} is a list, and d/d${v} cannot differentiate one` +
+        ` — write the derivative of its elements, like [d/d${v} f(${v}), …].`,
+    );
+  }
+  // Likewise a component that does not exist: F_1 of a vector-valued
+  // function F, or G_1 of a point whose components are G_x, G_y, G_z, is an
+  // unknown name that would differentiate to 0 (a Jacobian of zeros).
+  for (const name of freeVars(e)) {
+    const base = /^(.+)_[^_]+$/.exec(name)?.[1];
+    if (!base || opts?.definition?.(name) || opts?.isList?.(name)) continue;
+    const comps = opts?.comps?.(base);
+    if (comps && !comps.includes(name)) {
+      throw new Error(`${name} is not defined — ${base}'s components are ${comps.join(', ')}.`);
+    }
+    if (!comps && getFn?.(base)) {
+      throw new Error(
+        `${name} is not defined — ${base} is a function. Name its value first, like G = ${base}(x, y, z), then use G_x, G_y, G_z.`,
+      );
+    }
+  }
+  for (let k = 0; k < order; k++) {
+    try {
+      e = diff(e, v);
+    } catch (err) {
+      if (!(err instanceof NonSmoothError)) throw err;
+      // factorial, gamma, floor, …: expand a symbolic central difference,
+      // the fallback roots.ts and the renderer's normals use when diff() throws.
+      const vv: Expr = { kind: 'var', name: v };
+      e = div(sub(substVars(e, { [v]: add(vv, num(FD_H)) }), substVars(e, { [v]: sub(vv, num(FD_H)) })), num(2 * FD_H));
+    }
+  }
+  return e;
+}
+
+/**
+ * Rewrite a division that spells a Leibniz derivative. Juxtaposition after
+ * a Leibniz head binds tighter than '/', spaced or not (addImplicitTokens),
+ * so `d/dx expr` parses as d / (dx · expr): the operand is the tail of the
+ * denominator's product chain.
+ */
+function matchDeriv(numr: Expr, den: Expr, opts?: ResolveOpts, getFn?: GetFn): Expr | null {
+  const head = numeratorWrap(numr);
+  if (!head) return null;
+  const factors: Expr[] = [];
+  let leftmost = den;
+  while (leftmost.kind === 'bin' && leftmost.op === '*') {
+    factors.unshift(leftmost.b);
+    leftmost = leftmost.a;
+  }
+  const dx = dxOrder(leftmost);
+  if (!dx || dx.order !== head.order || factors.length === 0) return null;
+  let operand = factors[0];
+  for (let k = 1; k < factors.length; k++) operand = { kind: 'bin', op: '*', a: operand, b: factors[k] };
+  return head.wrap(applyDiff(operand, dx.v, head.order, opts, getFn));
+}
+
+const num = (value: number): Expr => ({ kind: 'num', value });
+
+/**
+ * `e` with the named definitions it reaches that depend on position written
+ * out. Differentiation has to see through them: with `g = x^2 + y^2`, the
+ * name g alone differentiates as a constant, so `d/dx g` and `grad(g)` were
+ * silently 0. Names whose value does not use x, y or z (sliders, animated
+ * constants) stay names. `over` asks for other variables instead: u writes
+ * out a named curve and the scalars over u it uses.
+ */
+export function throughFields(e: Expr, opts?: ResolveOpts, over: ReadonlySet<string> = SPACE): Expr {
+  const lookup = opts?.definition;
+  if (!lookup) return e;
+  const closed = (name: string, seen: ReadonlySet<string>): Expr | null => {
+    if (over.has(name) || seen.has(name)) return null;
+    const value = lookup(name);
+    if (!value || value.kind === 'vec' || value.kind === 'list') return null;
+    const inner = new Set(seen).add(name);
+    const sub: Record<string, Expr> = {};
+    for (const v of freeVars(value)) {
+      const c = closed(v, inner);
+      if (c) sub[v] = c;
+    }
+    const out = Object.keys(sub).length ? substVars(value, sub) : value;
+    return [...freeVars(out)].some(v => over.has(v)) ? out : null;
+  };
+  const sub: Record<string, Expr> = {};
+  for (const v of freeVars(e)) {
+    const c = closed(v, new Set());
+    if (c) sub[v] = c;
+  }
+  return Object.keys(sub).length ? substVars(e, sub) : e;
+}
+
+export interface ResolveOpts {
+  /** The document's shadowed names (shadowedNames), for every parse of its
+   *  rows' parts: `e` after `e := 2` reads as that e in a sequence too. */
+  valueNames?: ReadonlySet<string>;
+  /** A sequence term by name (a_3, a_k) or index (a_[…]). `open` are the
+   *  names still unbound here — a sequence row's own index. */
+  sequenceTerm?: (name: string, index: Expr | undefined, open: ReadonlySet<string> | undefined) => Expr | null;
+  /** A tuple-valued recurrence's terms, as far as its run goes (lib/seq.ts);
+   *  null for any other name. */
+  tupleRun?: (name: string) => import('./seq.ts').TupleRun | null;
+  /** Definition values cannot contain row-only motion trails. */
+  inDefinition?: boolean;
+  /** Numeric constant values, used to evaluate Σ/Π bounds at expansion time. */
+  consts?: Record<string, number>;
+  /** Out: constant names referenced by Σ/Π bounds (their sliders snap to integers). */
+  boundConsts?: Set<string>;
+  /**
+   * Names a Σ/Π bound may use without a static value — the sequence index,
+   * and the index of a sum that itself could not expand yet. The sum stays
+   * a call and evaluate() runs it.
+   */
+  openVars?: ReadonlySet<string>;
+  /**
+   * A piecewise case may test equality, `{s = 3: 1, 0}`: the rows of the
+   * integer lattice (lib/automaton.ts), whose cells are whole numbers.
+   * Elsewhere an equation as a condition is a reduction's filter.
+   */
+  exactConditions?: boolean;
+  /**
+   * Whether a name is a list. Derivatives expand HERE, before list.ts
+   * substitutes, so without this `d/dt L` differentiates `L` as an opaque
+   * variable and quietly becomes 0.
+   */
+  isList?: (name: string) => boolean;
+  /**
+   * A list's value, for a Σ/Π whose bound is a list: `N = [3..5]` then
+   * `sum(n=1..N, …)` expands once per element, into a list over N's axes.
+   */
+  getList?: GetList;
+  /**
+   * What is wrong with `L[idx]` judged by SHAPE alone — a slice, a filter no
+   * list reaches, a whole-plot call over one — or null if nothing is. Asked
+   * before list.ts lowers anything, because lowering needs the bytes and the
+   * answer must not: see indexIssue.
+   */
+  indexIssue?: (idx: Expr, target: Expr) => string | null;
+  /**
+   * The value of a name defined as a number or field (`g = x^2 + y^2`, or a
+   * named vector's component F_x), so derivatives can differentiate through
+   * it — see throughFields. Undefined for anything else.
+   */
+  definition?: (name: string) => Expr | undefined;
+  /** The component names a named vector lowers to (F → F_x, F_y), so the
+   *  vector operators see a named field's components. */
+  comps?: (name: string) => readonly string[] | null;
+  /**
+   * Every name the document binds. The unit vectors e_x, e_y, e_z are in
+   * scope only when this is given and does not hold them: a caller that
+   * cannot see the whole document cannot tell `e_x = 3` from the built-in.
+   */
+  documentNames?: ReadonlySet<string>;
+  /**
+   * The value of a name whose definition holds a continuous interval
+   * (`r = interval(1, 2)`, or `s = 2 r` after it): written in wherever the
+   * name appears, so every mention is the same hidden parameter
+   * (lib/interval.ts). Undefined for anything else.
+   */
+  interval?: (name: string) => Expr | undefined;
+  /**
+   * The value of a name defined as a multivector (`R = e^(-t/2 e_xy)`): its
+   * internal `[mv]` node, written in wherever the name appears, as an
+   * interval is (lib/clifford.ts). Undefined for anything else.
+   */
+  multivector?: (name: string) => Expr | undefined;
+  /**
+   * The value of a name defined as a complex number (`a = e^(iπ/3)`),
+   * written in wherever the name appears, as an interval is. Undefined for
+   * anything else.
+   */
+  complex?: (name: string) => Expr | undefined;
+  /**
+   * A function's parameters, while its body resolves: there `x` is the
+   * argument, not the continuous multiset a reduction would integrate over
+   * (lib/measure.ts).
+   */
+  params?: ReadonlySet<string>;
+  /**
+   * The surface a panel's rows are drawn on (an on(…) row, lib/surface-map.ts):
+   * there gaussian(x, y) and meancurvature(x, y) read it, in the panel's x
+   * and y.
+   */
+  surface?: { readonly embed: readonly [Expr, Expr, Expr] };
+}
+
+/**
+ * The unit vectors (docs/multisets.md §4), so `[0,1] e_x` is two points.
+ * Unlike pi and e they are resolved rather than parsed, so a document that
+ * defines `e_x` keeps its own. They are always 3D: a row using one is a 3D
+ * scene, as `(1,0,0)` makes it.
+ */
+const UNIT_VECTORS: Readonly<Record<string, readonly number[]>> = {
+  e_x: [1, 0, 0],
+  e_y: [0, 1, 0],
+  e_z: [0, 0, 1],
+};
+
+function unitVector(name: string, opts: ResolveOpts): Expr | null {
+  const axis = Object.hasOwn(UNIT_VECTORS, name) ? UNIT_VECTORS[name] : null;
+  // e_xy, e_zx, e_xyz: the blades of space, multivectors (lib/clifford.ts).
+  const blade = axis ? null : bladeByName(name);
+  // (An open Σ index of that name is bound, not the vector.)
+  if ((!axis && !blade) || !opts.documentNames || opts.documentNames.has(name) || opts.openVars?.has(name)) return null;
+  return blade ? mvNode(blade) : { kind: 'vec', items: axis!.map(num) };
+}
+
+export interface Ctx {
+  getFn: GetFn;
+  opts: ResolveOpts;
+  /** Terms expanded so far across every Σ/Π in this resolve (nesting multiplies). */
+  terms: number;
+  /** Out (resolveRow): every ∫ this resolve expanded — its resolved pieces
+   *  when it is a plain definite integral, null otherwise (indefinite, or
+   *  carrying an enclosing integral's measure). */
+  ints?: Array<IntShade | null>;
+  /** The resolver. Expansion passes in other files recurse through it. */
+  rx: (e: Expr, ctx: Ctx) => Expr;
+}
+
+/** A Σ/Π call: args [index, lo, hi] (header awaiting a body) or [index, lo, hi, body]. */
+export type SumCall = Expr & { kind: 'call'; name: 'sum' | 'prod' };
+
+export const isSumHeader = (e: Expr): e is SumCall =>
+  e.kind === 'call' && (e.name === 'sum' || e.name === 'prod') && e.args.length === 3;
+
+/** An ∫ header awaiting its body: `int[a..b]` (bounds) or a bare `int`/∫. */
+export const isIntHeader = (e: Expr): boolean =>
+  (e.kind === 'call' && e.name === 'int' && e.args.length === 2) || (e.kind === 'var' && e.name === 'int');
+
+/**
+ * A header in a product chain binds its trailing factors: in
+ * `2 sum[n=1..N] sin(n x)/n` the body is sin(n x)/n and the 2 stays outside
+ * (like d/dx, which also binds the rest of its product chain). ∫ headers
+ * (`int[a..b] f dx`, bare `∫ f dx`) bind the same way; the LEFTMOST header
+ * wins, so `int[0..1] sum[n=1..2] x^n dx` nests the Σ inside the ∫'s body.
+ */
+function splitSumChain(e: Expr): { coeff: Expr | null; op: '*' | '/'; header: Expr; body: Expr } | null {
+  const factors: Array<{ e: Expr; op: '*' | '/' }> = [];
+  let node: Expr = e;
+  while (node.kind === 'bin' && (node.op === '*' || node.op === '/')) {
+    factors.unshift({ e: node.b, op: node.op });
+    node = node.a;
+  }
+  factors.unshift({ e: node, op: '*' });
+  const at = factors.findIndex(f => isSumHeader(f.e) || isIntHeader(f.e));
+  if (at < 0) return null;
+  const rest = factors.slice(at + 1);
+  if (!rest.length) return null; // bodyless header: the call case reports it
+  let body: Expr = rest[0].op === '*' ? rest[0].e : { kind: 'bin', op: '/', a: num(1), b: rest[0].e };
+  for (let k = 1; k < rest.length; k++) body = { kind: 'bin', op: rest[k].op, a: body, b: rest[k].e };
+  let coeff: Expr | null = null;
+  for (let k = 0; k < at; k++) {
+    coeff = coeff === null ? factors[k].e : { kind: 'bin', op: factors[k].op, a: coeff, b: factors[k].e };
+  }
+  return { coeff, op: factors[at].op, header: factors[at].e, body };
+}
+
+/** The bounds of an ∫ header, or null for the bare indefinite form. */
+const intBounds = (header: Expr): [Expr, Expr] | null =>
+  header.kind === 'call' && header.args.length === 2 ? [header.args[0], header.args[1]] : null;
+
+/** Canonical call node for an ∫ header + its chain-bound body. */
+const intCallOf = (header: Expr, body: Expr): Expr => {
+  const b = intBounds(header);
+  return { kind: 'call', name: 'int', args: b ? [b[0], b[1], body] : [body] };
+};
+
+const SEQ_LETTER = new RegExp(`^[A-Za-z${GREEK_NAME_CHARS}]$`);
+
+/** substVars for a Σ/Π index, stopping at nested Σ/Π that rebind the same name. */
+export function substIdx(e: Expr, idx: string, val: Expr): Expr {
+  switch (e.kind) {
+    case 'index':
+    case 'range':
+    case 'eqtest':
+    case 'comp':
+    case 'figure':
+    case 'lazy':
+    case 'trail':
+    case 'label':
+    case 'hist':
+    case 'family':
+      return mapChildren(e, x => substIdx(x, idx, val));
+    case 'num':
+      return e;
+    case 'var': {
+      if (e.name === idx) return val;
+      // A subscript written with the index names a term: a_n at n = 3 is a_3.
+      const at =
+        e.name.length === idx.length + 2 &&
+        e.name.endsWith(`_${idx}`) &&
+        val.kind === 'num' &&
+        Number.isInteger(val.value) &&
+        val.value >= 0 &&
+        SEQ_LETTER.test(e.name[0]);
+      return at ? { kind: 'var', name: `${e.name[0]}_${val.value}` } : e;
+    }
+    case 'neg':
+      return { kind: 'neg', a: substIdx(e.a, idx, val) };
+    case 'bin': {
+      if (e.op === '*' || e.op === '/') {
+        const m = splitSumChain(e);
+        if (m) {
+          // A bodyless header binds the rest of its product chain as its body
+          // (`sum[n=1..2] sum[n=1..3] n`). Canonicalize to the full call so
+          // the rebinding guard below sees that body as the inner binder's
+          // own, not as a sibling factor ours may substitute into.
+          const canonical: Expr = isSumHeader(m.header)
+            ? { kind: 'call', name: m.header.name, args: [...m.header.args, m.body] }
+            : intCallOf(m.header, m.body);
+          const call = substIdx(canonical, idx, val);
+          return m.coeff ? { kind: 'bin', op: m.op, a: substIdx(m.coeff, idx, val), b: call } : call;
+        }
+      }
+      return { kind: 'bin', op: e.op, a: substIdx(e.a, idx, val), b: substIdx(e.b, idx, val) };
+    }
+    case 'call': {
+      if ((e.name === 'sum' || e.name === 'prod') && e.args[0]?.kind === 'var' && e.args[0].name === idx) {
+        // The inner Σ rebinds idx: substitute in its bounds but not its body.
+        const args = e.args.map((a, k) => (k === 0 || k === 3 ? a : substIdx(a, idx, val)));
+        return { kind: 'call', name: e.name, args };
+      }
+      if (e.name === 'int' && (e.args.length === 1 || e.args.length === 3)) {
+        // An ∫ whose dx names this index rebinds it: bounds only.
+        const bodyAt = e.args.length - 1;
+        let dx: { v: string } | null = null;
+        try {
+          dx = stripDx(e.args[bodyAt]);
+        } catch {
+          /* multiple dx factors: expansion will report it */
+        }
+        if (dx && dx.v === idx) {
+          const args = e.args.map((a, k) => (k === bodyAt ? a : substIdx(a, idx, val)));
+          return { kind: 'call', name: 'int', args };
+        }
+      }
+      return { kind: 'call', name: e.name, args: e.args.map(a => substIdx(a, idx, val)) };
+    }
+    case 'eq':
+      return { kind: 'eq', l: substIdx(e.l, idx, val), r: substIdx(e.r, idx, val) };
+    case 'ineq':
+      return { ...e, l: substIdx(e.l, idx, val), r: substIdx(e.r, idx, val) };
+    case 'vec':
+      return { kind: 'vec', items: e.items.map(a => substIdx(a, idx, val)) };
+    case 'list':
+      return sameList(e, { kind: 'list', items: e.items.map(a => substIdx(a, idx, val)) });
+    case 'data':
+    case 'str':
+    case 'text':
+      return e;
+    case 'piecewise':
+      return {
+        kind: 'piecewise',
+        cases: e.cases.map(c => ({ ...c, cond: substIdx(c.cond, idx, val), value: substIdx(c.value, idx, val) })),
+        otherwise: e.otherwise && substIdx(e.otherwise, idx, val),
+      };
+    // A loop's params rebind inside its body: substitute in the seeds only.
+    case 'loop':
+      return {
+        ...e,
+        seeds: e.seeds.map(a => substIdx(a, idx, val)),
+        body: e.params.includes(idx) ? e.body : substIdx(e.body, idx, val),
+      };
+  }
+}
+
+const FOLD_BUILD = { '+': add, '-': sub, '*': mul, '/': div, '^': pow } as const;
+
+/**
+ * Fold numeric subtrees ((2·3-1) → 5) so expanded Σ terms compile to compact
+ * GLSL. With `calls`, a call whose arguments all folded (cos(1/3)) folds too,
+ * for consumers that evaluate the tree on the CPU rather than emit it.
+ */
+export function foldNums(e: Expr, calls = false): Expr {
+  const fold = (x: Expr) => foldNums(x, calls);
+  switch (e.kind) {
+    case 'index':
+    case 'range':
+    case 'eqtest':
+    case 'comp':
+    case 'figure':
+    case 'lazy':
+    case 'trail':
+    case 'label':
+    case 'hist':
+    case 'family':
+      return mapChildren(e, fold);
+    case 'num':
+    case 'var':
+      return e;
+    case 'neg':
+      return neg(fold(e.a));
+    case 'bin': {
+      const a = fold(e.a);
+      const b = fold(e.b);
+      if (a.kind === 'num' && b.kind === 'num') {
+        const v = evaluate({ kind: 'bin', op: e.op, a, b }, {});
+        if (isFinite(v)) return num(v);
+      }
+      return FOLD_BUILD[e.op](a, b);
+    }
+    case 'call': {
+      const out: Expr = { kind: 'call', name: e.name, args: e.args.map(fold) };
+      if (calls && out.args.length && out.args.every(a => a.kind === 'num')) {
+        try {
+          const v = evaluate(out, {});
+          if (isFinite(v)) return num(v);
+        } catch {
+          /* not a scalar builtin: the interpreter keeps it */
+        }
+      }
+      return out;
+    }
+    case 'eq':
+      return { kind: 'eq', l: fold(e.l), r: fold(e.r) };
+    case 'ineq':
+      return { ...e, l: fold(e.l), r: fold(e.r) };
+    case 'vec':
+      return { kind: 'vec', items: e.items.map(fold) };
+    case 'list':
+      return sameList(e, { kind: 'list', items: e.items.map(fold) });
+    case 'data':
+    case 'str':
+    case 'text':
+      return e;
+    case 'piecewise':
+      return {
+        kind: 'piecewise',
+        cases: e.cases.map(c => ({ ...c, cond: fold(c.cond), value: fold(c.value) })),
+        otherwise: e.otherwise && fold(e.otherwise),
+      };
+    case 'loop':
+      return mapChildren(e, foldNums);
+  }
+}
+
+/**
+ * freeVars of an UNRESOLVED source. A Σ/Π index or an ∫'s measure variable
+ * is the binder's own name, not a reference — including in the chain forms
+ * (`sum[n=1..5] n`, `int[0..1] w^2 dw`), where the body is still a sibling
+ * factor that plain freeVars would read as free.
+ */
+function sourceFreeVars(e: Expr, out = new Set<string>()): Set<string> {
+  switch (e.kind) {
+    case 'var':
+      out.add(e.name);
+      return out;
+    case 'bin': {
+      if (e.op === '*' || e.op === '/') {
+        const m = splitSumChain(e);
+        if (m) {
+          if (m.coeff) sourceFreeVars(m.coeff, out);
+          const canonical: Expr = isSumHeader(m.header)
+            ? { kind: 'call', name: m.header.name, args: [...m.header.args, m.body] }
+            : intCallOf(m.header, m.body);
+          return sourceFreeVars(canonical, out);
+        }
+      }
+      sourceFreeVars(e.a, out);
+      return sourceFreeVars(e.b, out);
+    }
+    case 'call': {
+      if ((e.name === 'sum' || e.name === 'prod') && e.args.length === 4 && e.args[0].kind === 'var') {
+        sourceFreeVars(e.args[1], out);
+        sourceFreeVars(e.args[2], out);
+        const inner = sourceFreeVars(e.args[3]);
+        inner.delete(e.args[0].name);
+        for (const v of inner) out.add(v);
+        return out;
+      }
+      if (e.name === 'int' && (e.args.length === 1 || e.args.length === 3)) {
+        const bodyAt = e.args.length - 1;
+        for (let k = 0; k < bodyAt; k++) sourceFreeVars(e.args[k], out);
+        let dx: StripDx | null = null;
+        try {
+          dx = stripDx(e.args[bodyAt]);
+        } catch {
+          /* expansion reports it */
+        }
+        const inner = sourceFreeVars(e.args[bodyAt]);
+        if (dx) {
+          inner.delete(dx.v);
+          inner.delete(`d${dx.v}`);
+        }
+        for (const v of inner) out.add(v);
+        return out;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  for (const child of childrenOf(e)) sourceFreeVars(child, out);
+  return out;
+}
+
+export const SUM_MAX_TOTAL = 2000;
+/** Runs one state family may start: the point-figure family budget. */
+const FAMILY_MAX = 1024;
+
+/**
+ * Resolve a whole row, also reporting the ∫ it consists of: `integral` is set
+ * when the parsed row is exactly one definite integral — `int[a..b] f dx` or
+ * `int(a..b, f dx)` standing alone — and that was the ONLY ∫ the resolution
+ * expanded. A coefficient, a sum of integrals, an iterated or nested ∫ and an
+ * indefinite ∫ all report null, because no single region IS their value. The
+ * pieces are the ones expandInt itself resolved, not a second resolution.
+ * classifyRow (lib/plot.ts) turns them into the area a value row shades.
+ */
+export function resolveRow(e: Expr, getFn: GetFn, opts: ResolveOpts = {}): ResolvedRow {
+  const ctx: Ctx = { getFn, opts, terms: 0, ints: [], rx };
+  const expr = rx(e, ctx);
+  const m = splitSumChain(e);
+  const call = !m ? e : !m.coeff && isIntHeader(m.header) ? intCallOf(m.header, m.body) : null;
+  const sole = call?.kind === 'call' && call.name === 'int' && call.args.length === 3 && ctx.ints!.length === 1;
+  return { expr, integral: sole ? ctx.ints![0] : null };
+}
+
+/** Multivector functions (lib/clifford.ts): their values may be quaternions. */
+const MV_VALUED = new Set(['quat', 'gp', 'rev', 'dual', 'slerp', 'grade', 'vec']);
+
+/**
+ * Whether a resolved argument may lower to a point or a quaternion — a tuple,
+ * a named point or unit vector, or multivector algebra somewhere inside — and
+ * so fill more than one parameter. Anything else is one number.
+ */
+function mightBePoint(e: Expr, opts: ResolveOpts): boolean {
+  if (e.kind === 'vec') return true;
+  if (e.kind === 'var') return !!opts.comps?.(e.name) || /^e_[xyz]+$/.test(e.name);
+  if (e.kind === 'call' && MV_VALUED.has(e.name)) return true;
+  if (e.kind === 'bin' && e.glyph === 'geometric') return true;
+  return childrenOf(e).some(c => mightBePoint(c, opts));
+}
+
+const COORDS = ['x', 'y', 'z'] as const;
+
+/** The parameters a body reduces over: those inside a reduction's argument
+ *  (a dotted p.x counts as p). Only those make a call a map. */
+const reducedCache = new WeakMap<Expr, Set<string>>();
+function reducedParams(body: Expr): Set<string> {
+  let hit = reducedCache.get(body);
+  if (hit) return hit;
+  hit = new Set<string>();
+  const walk = (e: Expr): void => {
+    if (e.kind === 'call' && reducesMembers(e.name, e.args.length))
+      for (const a of e.args) for (const v of freeVars(a)) hit!.add(v.split('.')[0]);
+    childrenOf(e).forEach(walk);
+  };
+  walk(body);
+  reducedCache.set(body, hit);
+  return hit;
+}
+
+/** A list drawn by a binder: the same members, one axis of its own. A
+ *  scatter of columns is drawn column by column, on that one axis; a tuple,
+ *  one ordered value with no members to choose among, is itself. */
+function drawnFrom(name: string, e: Expr): Expr {
+  if (e.kind === 'vec') return { ...e, items: e.items.map(c => drawnFrom(name, c)) };
+  // A number beside a scatter's columns, `(T.a, 0)`, is the same in every draw.
+  if (!isSeq(e)) return e;
+  const own = axesOf(e as Seq);
+  const positions = own.filter(a => a.ordered);
+  if (positions.length === own.length) return e;
+  const n = own.filter(a => !a.ordered).reduce((size, a) => size * a.n, 1);
+  return copiedList(e, withAxes({ ...e } as Seq, [{ id: `${name}∈`, n }, ...positions]));
+}
+
+/** The name a mapped parameter takes in its body: one no document can spell
+ *  (so nothing is captured), the same every time the row resolves. */
+const mapName = (fn: string, k: number) => `@${fn}:${k}`;
+
+/** Whether a resolved argument may be a list: a literal, a column, or a
+ *  name (or a dotted column of one) the document defines as a list. */
+function mayBeList(a: Expr, opts: ResolveOpts): boolean {
+  if (a.kind === 'list' || a.kind === 'data') return true;
+  if (a.kind === 'var') return !!opts.isList?.(a.name.split('.')[0]);
+  return childrenOf(a).some(c => mayBeList(c, opts));
+}
+
+/** `P.x` of one named point is its coordinate P_x, as `A.x` of a list of
+ *  points is that list's (list lowering reads those). */
+function pointCoord(name: string, opts: ResolveOpts): Expr | null {
+  const dot = name.lastIndexOf('.');
+  const k = dot > 0 ? COORDS.indexOf(name.slice(dot + 1) as (typeof COORDS)[number]) : -1;
+  if (k < 0) return null;
+  const base = name.slice(0, dot);
+  // A parameter's coordinates are its argument's (coordParams), even where a
+  // point of the document has the same name.
+  if (opts.isList?.(base) || opts.params?.has(base)) return null;
+  const comps = opts.comps?.(base);
+  return comps && k < comps.length ? { kind: 'var', name: comps[k] } : null;
+}
+
+/**
+ * The coordinates of point parameters a body reads, `p.x` in
+ * `c(p, q) = {p.y = q.x: (p.x, q.y)}`, as the argument's own: a name's
+ * coordinates are its dotted names, so they move with every other use of it
+ * (c(A, A) is the diagonal), a tuple gives up its items, and anything else
+ * takes a component of that one node.
+ */
+function coordParams(
+  fn: { params: readonly string[]; body: Expr },
+  args: readonly Expr[],
+  name: string,
+  opts: ResolveOpts,
+) {
+  const used = freeVars(fn.body);
+  const env: Record<string, Expr> = {};
+  fn.params.forEach((p, j) => {
+    const arg = args[j];
+    const read = COORDS.map((c, k) => [`${p}.${c}`, k] as const).filter(([v]) => used.has(v));
+    if (!read.length) return;
+    // (Arity 0: any point that has the coordinate, 2D or 3D alike.)
+    for (const [v, k] of read) {
+      // A list's coordinates are its dotted columns, which move with every
+      // other use of it (c(A, A) is the diagonal); a named point's are its
+      // own (P_x); anything else, a matrix included, is read as a component.
+      const own = arg.kind === 'var' ? pointCoord(`${arg.name}.${COORDS[k]}`, opts) : null;
+      if (arg.kind === 'var' && opts.isList?.(arg.name)) env[v] = { kind: 'var', name: `${arg.name}.${COORDS[k]}` };
+      else if (own) env[v] = own;
+      else if (arg.kind === 'vec') {
+        if (k >= arg.items.length) throw new Error(compDims(name, 0, arg, arg.items.length));
+        env[v] = arg.items[k];
+      } else env[v] = { kind: 'comp', value: arg, index: k, arity: 0, functionName: name };
+    }
+  });
+  return env;
+}
+
+/**
+ * Inline user-function calls, resolve d/dx derivative notation, and expand
+ * Σ/Π sums and ∫ integrals (post-order).
+ */
+/** A name with a subscript, a_3 or s_n: the only kind a term can have. */
+const SUBSCRIPTED = /^[^_]+_[^_]/;
+
+/** A tuple read as a stack (docs/discrete.md, pushdown automata). */
+export const STACK_FNS: ReadonlySet<string> = new Set(['push', 'pop', 'top']);
+
+/** The numbers of a tuple written out: a tuple of numbers, the empty tuple,
+ *  or one number (a 1-tuple is its element). Null for anything else. */
+export function literalTuple(e: Expr): number[] | null {
+  if (e.kind === 'num') return [e.value];
+  if ((e.kind === 'vec' || (e.kind === 'list' && isTuple(e))) && e.items.every(x => x.kind === 'num'))
+    return e.items.map(x => (x as Expr & { kind: 'num' }).value);
+  return null;
+}
+
+/** A tuple as an expression, as the document writes one: one number is a
+ *  number, two or three a point, any other length a tuple. */
+export function tupleExpr(values: readonly number[]): Expr {
+  if (values.length === 1) return { kind: 'num', value: values[0] };
+  const items = values.map((value): Expr => ({ kind: 'num', value }));
+  return values.length === 2 || values.length === 3
+    ? { kind: 'vec', items }
+    : withAxes({ kind: 'list', items }, [tupleAxis(values.length)]);
+}
+
+/**
+ * push(s, a, …), pop(s), top(s) on a tuple of numbers, computed now; null
+ * while s is not one yet (a parameter, or a step of a tuple-valued
+ * recurrence that lib/seq.ts runs). Off the end of a stack is out of range,
+ * the way a run off the end of its input is.
+ */
+export function stackCall(name: string, args: readonly Expr[]): Expr | null {
+  if (!args.length) throw new Error(`${name} takes a tuple: ${name === 'push' ? 'push(s, a)' : `${name}(s)`}.`);
+  const s = literalTuple(args[0]);
+  if (name !== 'push' && args.length !== 1) throw new Error(`${name} takes one tuple: ${name}(s).`);
+  if (name === 'push') {
+    const rest = args.slice(1).map(literalTuple);
+    if (!s || rest.some(r => !r)) return null;
+    return tupleExpr([...s, ...rest.flatMap(r => r!)]);
+  }
+  // The empty tuple's top is not an error yet: the case that reads it may
+  // not be the one that holds (lib/seq.ts runs only that one).
+  if (!s?.length) return null;
+  return name === 'top' ? { kind: 'num', value: s[s.length - 1] } : tupleExpr(s.slice(0, -1));
+}
+
+export function resolveExpr(e: Expr, getFn: GetFn, opts: ResolveOpts = {}): Expr {
+  return rx(e, { getFn, opts, terms: 0, rx });
+}
+
+/** What a map's row knows of its document: the names it defines, its
+ *  functions and lists (which a map's Σ/Π bound cannot use: it is parsed
+ *  without them), and where to note a slider used as a bound (so it steps in
+ *  whole numbers). `budget` counts
+ *  the terms written out so far, shared by a row's maps and components
+ *  under one limit as a row's tuple is. */
+export type MapDoc = Pick<ResolveOpts, 'documentNames' | 'boundConsts' | 'isList' | 'getList' | 'valueNames'> & {
+  fnNames?: ReadonlySet<string>;
+  budget?: { terms: number };
+};
+
+/**
+ * A map's expression — a view's axis or plane map, an on(…) surface — with
+ * its Σ/Π written out term by term, so the GPU and the CPU both see plain
+ * arithmetic. Only the sums are expanded: the rest stays as written (a d/dx
+ * in a map is refused inside a sum or out). Each sum's bounds go through
+ * expandSum as a row's do, so they read the sliders in `consts` under the
+ * same limits, counted across all of `e` and doc.budget; a bound in `coords`, the map's own coordinates, is refused,
+ * as they change from point to point. A bare function name (`cos X`) is
+ * caught here too, where it would otherwise read as a name with no value.
+ */
+export function expandMapSums(
+  e: Expr,
+  coords: readonly string[],
+  consts: Record<string, number>,
+  doc: MapDoc = {},
+): Expr {
+  const budget = doc.budget ?? { terms: 0 };
+  const expand = (call: SumCall, body: Expr): Expr => {
+    const sym = call.name === 'sum' ? 'Σ' : 'Π';
+    for (const b of call.args.slice(1, 3))
+      for (const v of freeVars(b))
+        if (coords.includes(v))
+          throw new Error(`${sym} needs bounds that are fixed numbers or sliders; ${v} changes across the map.`);
+        else if (doc.fnNames?.has(v))
+          throw new Error(`${sym} in a map takes numbers and sliders as bounds; it cannot call ${v} yet.`);
+    // Expanded with a marker for a body, which says which indices the bounds
+    // take; the body itself is written in at each, unresolved.
+    const idx = call.args[0];
+    const marker = (k: Expr): Expr => ({ kind: 'call', name: 'floor', args: [k] });
+    const marked = resolveExpr({ ...call, args: [...call.args.slice(0, 3), marker(idx)] }, () => undefined, {
+      consts,
+      boundConsts: doc.boundConsts,
+      isList: doc.isList,
+      getList: doc.getList,
+    });
+    const at: number[] = [];
+    const read = (m: Expr): void => {
+      if (m.kind === 'call' && m.name === 'floor' && m.args[0].kind === 'num') at.push(m.args[0].value);
+      else if (m.kind === 'bin' && m.op === (call.name === 'sum' ? '+' : '*')) {
+        read(m.a);
+        read(m.b);
+      } else if (!(m.kind === 'num' && at.length === 0))
+        // A list bound makes a family of sums, one per element.
+        throw new Error(`${sym} in a map needs each bound to be one number, not a list.`);
+    };
+    read(marked);
+    budget.terms += at.length;
+    if (budget.terms > SUM_MAX_TOTAL)
+      throw new Error(`Nested ${sym} expand to too many terms (limit ${SUM_MAX_TOTAL} total).`);
+    // expandSum has refused any index but a name.
+    const name = (idx as Expr & { kind: 'var' }).name;
+    const combine = call.name === 'sum' ? add : mul;
+    let acc: Expr | null = null;
+    for (const k of at) {
+      const term = foldNums(walk(substIdx(body, name, num(k))));
+      acc = acc === null ? term : combine(acc, term);
+    }
+    return acc ?? num(call.name === 'sum' ? 0 : 1);
+  };
+  const walk = (e: Expr): Expr => {
+    if (e.kind === 'call' && (e.name === 'sum' || e.name === 'prod'))
+      // Without a body, resolving says so as it does in a row.
+      return e.args.length === 4 ? expand(e as SumCall, e.args[3]) : resolveExpr(e, () => undefined);
+    // `2 sum[n=1..3] Y^n/n`: the header binds the rest of its product.
+    const chain = e.kind === 'bin' ? splitSumChain(e) : null;
+    if (chain && isSumHeader(chain.header)) {
+      const sum = expand(chain.header, chain.body);
+      return chain.coeff ? { kind: 'bin', op: chain.op, a: walk(chain.coeff), b: sum } : sum;
+    }
+    return mapChildren(e, walk);
+  };
+  const out = walk(e);
+  for (const v of freeVars(out))
+    if (builtinFn(v) === v && !(v in consts) && !doc.documentNames?.has(v))
+      throw new Error(`${v} is a function — write it with parentheses, e.g. ${v}(${coords[0]}).`);
+  return out;
+}
+
+/**
+ * The inequality a resolved name or call stands for — a document's named
+ * condition (`within = r < R`), or a function body that is one — or null.
+ * A function's parameter is its argument, never the document's name.
+ */
+function conditionOf(resolved: Expr, ctx: Ctx): Expr | null {
+  if (resolved.kind === 'ineq' || resolved.kind === 'eq') return resolved;
+  return (resolved.kind === 'var' && namedConditionOf(ctx)(resolved.name)) || null;
+}
+
+/** The document's condition of a name, unless a parameter shadows it. */
+const namedConditionOf =
+  (ctx: Ctx) =>
+  (name: string): Expr | undefined => {
+    if (ctx.opts.params?.has(name)) return undefined;
+    const value = ctx.opts.definition?.(name);
+    return value?.kind === 'ineq' ? value : undefined;
+  };
+
+/** What a condition's name says when it is read as a number. */
+const conditionAsNumber = (name: string): string =>
+  `${name} is a condition, not a number — read it in braces, like {${name}: 1}.`;
+
+/**
+ * Named conditions written in where a condition is read — a piecewise case's
+ * condition, or the whole expression — and nowhere else: one read as a number
+ * keeps its name, for the error that says so (conditionAsNumber).
+ */
+export function writeConditions(e: Expr, condition: (name: string) => Expr | undefined, whole = true): Expr {
+  if (e.kind === 'var') return (whole && condition(e.name)) || e;
+  if (e.kind !== 'piecewise') return mapChildren(e, c => writeConditions(c, condition, false));
+  let changed = false;
+  const write = (x: Expr, place: boolean): Expr => {
+    const next = writeConditions(x, condition, place);
+    if (next !== x) changed = true;
+    return next;
+  };
+  const cases = e.cases.map(c => ({ ...c, cond: write(c.cond, true), value: write(c.value, false) }));
+  const otherwise = e.otherwise && write(e.otherwise, false);
+  return changed ? { ...e, cases, otherwise } : e;
+}
+
+/**
+ * A piecewise condition written as a name (`{within: 1}`) or a call: the
+ * inequality it stands for, written in here, since every backend reads a
+ * condition by its shape. In a function body the name stays as written, and
+ * a call writes it in once the parameters are substituted (rx's call), so
+ * the body's x cannot capture the condition's x.
+ */
+function namedCondition(raw: Expr, resolved: Expr, ctx: Ctx): Expr {
+  if (raw.kind !== 'var' && raw.kind !== 'call') return resolved;
+  if (ctx.opts.params) return resolved;
+  const value = conditionOf(resolved, ctx);
+  if (value) return value;
+  // In a definition it may be named below: written in once every definition
+  // has resolved, or reported there.
+  if (ctx.opts.inDefinition) return resolved;
+  // `big = L > 1` is the members it keeps (docs/multisets.md), a list.
+  if (raw.kind === 'var' && ctx.opts.isList?.(raw.name))
+    throw new Error(`${raw.name} is a list, not a condition; write the comparison itself in the braces.`);
+  throw notACondition(raw);
+}
+
+function rx(e: Expr, ctx: Ctx): Expr {
+  const { getFn } = ctx;
+  switch (e.kind) {
+    case 'num':
+      return e;
+    case 'var':
+      return (
+        ctx.opts.sequenceTerm?.(e.name, undefined, ctx.opts.openVars) ??
+        ctx.opts.interval?.(e.name) ??
+        ctx.opts.multivector?.(e.name) ??
+        ctx.opts.complex?.(e.name) ??
+        unitVector(e.name, ctx.opts) ??
+        pointCoord(e.name, ctx.opts) ??
+        e
+      );
+    case 'neg':
+      return { kind: 'neg', a: rx(e.a, ctx) };
+    case 'bin': {
+      if (e.op === '*' || e.op === '/') {
+        const nabla = splitNablaChain(e, ctx);
+        if (nabla) return rx(nabla, ctx);
+        // Σ/∫ headers capture their trailing product chain before it
+        // resolves, so `sum[n=1..N] sin(n x)/n` divides each term, not the
+        // whole sum, and `int[0..1] x^2 dx` binds through to its dx.
+        const m = splitSumChain(e);
+        if (m) {
+          const body = isSumHeader(m.header)
+            ? expandSum(m.header, m.body, ctx)
+            : expandInt(intBounds(m.header), m.body, ctx);
+          return m.coeff ? { kind: 'bin', op: m.op, a: rx(m.coeff, ctx), b: body } : body;
+        }
+      }
+      const a = rx(e.a, ctx);
+      const b = rx(e.b, ctx);
+      if (e.op === '/') {
+        const d = matchDeriv(a, b, ctx.opts, ctx.getFn);
+        if (d) return d;
+      }
+      if (e.glyph) return { kind: 'bin', op: e.op, a, b, glyph: e.glyph };
+      if (e.op === '*' && a.kind === 'bin' && a.op === '/') {
+        // The parenthesized form (d/dx)(expr): the quotient is bare.
+        const head = numeratorWrap(a.a);
+        const dx = dxOrder(a.b);
+        if (head && dx && head.order === dx.order) {
+          return head.wrap(applyDiff(b, dx.v, head.order, ctx.opts, ctx.getFn));
+        }
+      }
+      return { kind: 'bin', op: e.op, a, b };
+    }
+    case 'index': {
+      if (e.args[0]?.kind === 'var') {
+        const term = ctx.opts.sequenceTerm?.(e.args[0].name, e.args[1], ctx.opts.openVars);
+        if (term) return term;
+        // s_3[2]: position 2 of a tuple-valued recurrence's term (lib/seq.ts).
+        // Only a subscripted name can be a term: D[n + 1] asks no more.
+        const whole = SUBSCRIPTED.test(e.args[0].name)
+          ? ctx.opts.sequenceTerm?.(e.args[0].name, undefined, ctx.opts.openVars)
+          : null;
+        const tuple = whole && literalTuple(whole);
+        if (tuple) {
+          const at = rx(e.args[1], ctx);
+          const consts = ctx.opts.consts ?? {};
+          const vars = [...freeVars(at)];
+          if (at.kind !== 'list' && at.kind !== 'range' && vars.every(v => consts[v] !== undefined)) {
+            for (const v of vars) ctx.opts.boundConsts?.add(v);
+            const k = evaluate(at, consts);
+            if (!Number.isInteger(k) || k < 1 || k > tuple.length)
+              throw new Error(
+                `${e.args[0].name}[${k}] is out of range: ${e.args[0].name} has ${tuple.length} element${tuple.length === 1 ? '' : 's'}.`,
+              );
+            return { kind: 'num', value: tuple[k - 1] };
+          }
+        }
+      }
+      return mapChildren(e, x => rx(x, ctx));
+    }
+    case 'range':
+      throw new Error(structuralDiagnostic(e));
+    case 'comp':
+    case 'eqtest':
+    case 'figure':
+    case 'lazy':
+    case 'trail':
+    case 'label':
+    case 'hist':
+    case 'family':
+      return mapChildren(e, x => rx(x, ctx));
+    case 'call': {
+      if (e.name === 'sum' || e.name === 'prod') {
+        if (e.args.length !== 4) {
+          throw new Error(
+            `${e.name === 'sum' ? 'Σ' : 'Π'} needs a body: write ${e.name}(n=1..N, …) or ${e.name}[n=1..N] (…).`,
+          );
+        }
+        return expandSum(e as SumCall, e.args[3], ctx);
+      }
+      if (e.name === 'int') {
+        if (e.args.length === 2) throw new Error('∫ needs a body: write int[a..b] f(x) dx.');
+        const body = e.args[e.args.length - 1];
+        return expandInt(e.args.length === 3 ? [e.args[0], e.args[1]] : null, body, ctx);
+      }
+      // A reduction over x, u, an interval or a filter is an integral against
+      // its measure (docs/multisets.md §5); over a list it lowers later.
+      // A tuple-valued recurrence's term counts its elements (lib/seq.ts),
+      // the empty tuple among them, which no list or point can be.
+      if (e.name === 'count' && e.args.length === 1) {
+        const arg = e.args[0];
+        const term =
+          arg.kind === 'var'
+            ? ctx.opts.sequenceTerm?.(arg.name, undefined, ctx.opts.openVars)
+            : arg.kind === 'index' && arg.args[0].kind === 'var'
+              ? ctx.opts.sequenceTerm?.(arg.args[0].name, arg.args[1], ctx.opts.openVars)
+              : null;
+        const tuple = term && literalTuple(term);
+        if (tuple) return { kind: 'num', value: tuple.length };
+      }
+      if (isReductionCall(e)) {
+        const over = reduceOverSet(e.name, e.args[0], {
+          resolve: x => rx(x, ctx),
+          // A reduction reads a condition by its shape, so even in a function
+          // body it is written in now — unless a parameter would capture it.
+          resolveCondition: x => {
+            const resolved = rx(x, ctx);
+            if (x.kind !== 'var' || resolved.kind !== 'var') return resolved;
+            const value = namedConditionOf(ctx)(resolved.name);
+            if (!value) return resolved;
+            const captured = [...freeVars(value)].find(v => ctx.opts.params?.has(v));
+            if (captured)
+              throw new Error(
+                `${resolved.name} reads ${captured}, which this function's parameter ${captured} would capture — rename the parameter.`,
+              );
+            return value;
+          },
+          integrate: (body, v, lo, hi) => integral(body, v, lo, hi, ctx, true),
+          consts: ctx.opts.consts,
+          isList: ctx.opts.isList,
+          bound: n => !!ctx.opts.params?.has(n) || !!ctx.opts.openVars?.has(n),
+        });
+        if ('expr' in over) return over.expr;
+        // A tuple literal spreads into arguments, as legacyCallArgs does.
+        const { arg } = over;
+        return { kind: 'call', name: e.name, args: e.args[0].kind === 'vec' && arg.kind === 'vec' ? arg.items : [arg] };
+      }
+      const fn = getFn(e.name);
+      // A function's arguments are as written when they fill its parameters:
+      // c((1, 2), (2, 5)) passes two points. Only a mismatch spreads tuples,
+      // f((a, b)) ≡ f(a, b), and a document's own function spreads them as
+      // any function does: the builtin of that name may group a tuple
+      // (frame((1, 2), 3)), but `frame(a, b, c) = a + b + c` spreads it.
+      const args = (
+        fn && !fn.recursive && e.args.length === fn.params.length ? e.args : legacyCallArgs(fn ? '' : e.name, e.args)
+      ).map(x => rx(x, ctx));
+      if (fn) {
+        const n = fn.params.length;
+        if (fn.recursive) {
+          // f((a, b)) ≡ f(a, b), as for any other call with a tuple in hand.
+          const splat = args.length === 1 && n >= 2 && args[0].kind === 'vec' ? args[0].items : args;
+          if (args.length === 1 && n >= 2 && args[0].kind === 'vec' && splat.length !== n)
+            throw new Error(compDims(e.name, n, args[0], splat.length));
+          // A computed point (or quaternion) spreads into consecutive
+          // parameters too — f(T(a, b) + P, k + 1) for f(a, b, k) — but how
+          // many it fills is only known once it lowers, so geometry lowering
+          // counts then (lib/geom.ts, case 'loop'). Arguments that cannot be
+          // points are counted here, where the definition was written.
+          if (splat.length !== n && !splat.some(a => mightBePoint(a, ctx.opts)))
+            throw new Error(`${e.name} takes ${n} argument${n === 1 ? '' : 's'}.`);
+          return { kind: 'call', name: RECUR, args: splat };
+        }
+        if (args.length === 1 && n >= 2 && args[0].kind !== 'num') {
+          // f(P) ≡ f(P_1, …, P_n): one argument that is an n-component point
+          // (or a list of them; a plain number is neither, and falls through to
+          // the arity error). A tuple in hand gives up its items; anything
+          // else is not known to be a point until it lowers, so each parameter
+          // asks for its component of the SAME node — which is what keeps a
+          // list argument's components moving together.
+          const [arg] = args;
+          markOrigins(arg);
+          if (arg.kind === 'vec' && arg.items.length !== n) throw new Error(compDims(e.name, n, arg, arg.items.length));
+          // A body that reduces takes a list of points one point at a time.
+          if (fn.params.some(p => reducedParams(fn.body).has(p)) && mayBeList(arg, ctx.opts)) {
+            const names = fn.params.map((_, k) => mapName(e.name, k));
+            const body = substVars(
+              fn.body,
+              Object.fromEntries(fn.params.map((p, k) => [p, { kind: 'var', name: names[k] }])),
+            );
+            return {
+              kind: 'call',
+              name: MAP,
+              args: [{ kind: 'str', value: e.name }, body, { kind: 'str', value: names.join(',') }, arg],
+            };
+          }
+          const comp = (k: number): Expr =>
+            arg.kind === 'vec' ? arg.items[k] : { kind: 'comp', value: arg, index: k, arity: n, functionName: e.name };
+          return expandClosedSums(substVars(fn.body, Object.fromEntries(fn.params.map((p, k) => [p, comp(k)]))), ctx);
+        }
+        if (args.length !== n) {
+          throw new Error(`${e.name} takes ${n} argument${n === 1 ? '' : 's'}.`);
+        }
+        // Every function applies per member (docs/multisets.md §0). A body
+        // that only maps is that already, by substitution; one that reduces
+        // would consume a list argument along with its own lists, so a list
+        // argument is bound per member instead ([map], lib/list.ts).
+        // (Once it is one, every list argument is bound per member, so the
+        // same list passed twice zips; and all parameters are replaced in one
+        // step, the list ones by names no document can spell, so an argument
+        // mentioning a parameter's name is never captured by it.)
+        const reduced = reducedParams(fn.body);
+        const listy = fn.params.map((_, k) => mayBeList(args[k], ctx.opts));
+        if (fn.params.some((p, k) => reduced.has(p) && listy[k])) {
+          const scalar = fn.params.filter((_, k) => !listy[k]);
+          const env: Record<string, Expr> = {
+            ...Object.fromEntries(scalar.map(p => [p, args[fn.params.indexOf(p)]])),
+            ...coordParams(
+              { params: scalar, body: fn.body },
+              scalar.map(p => args[fn.params.indexOf(p)]),
+              e.name,
+              ctx.opts,
+            ),
+          };
+          const pairs: Expr[] = [];
+          fn.params.forEach((p, k) => {
+            if (!listy[k]) return;
+            const name = mapName(e.name, k);
+            env[p] = { kind: 'var', name };
+            for (const c of COORDS) env[`${p}.${c}`] = { kind: 'var', name: `${name}.${c}` };
+            pairs.push({ kind: 'str', value: name }, args[k]);
+          });
+          return { kind: 'call', name: MAP, args: [{ kind: 'str', value: e.name }, substVars(fn.body, env), ...pairs] };
+        }
+        const inlined = expandClosedSums(
+          substVars(fn.body, {
+            ...Object.fromEntries(fn.params.map((p, k) => [p, args[k]])),
+            ...coordParams(fn, args, e.name, ctx.opts),
+          }),
+          ctx,
+        );
+        // The body's named conditions, now that its parameters are its
+        // arguments and cannot capture their variables (namedCondition). In
+        // another function's body they wait for that function's call.
+        return ctx.opts.params ? inlined : writeConditions(inlined, namedConditionOf(ctx));
+      }
+      if (STACK_FNS.has(e.name)) return stackCall(e.name, args) ?? { kind: 'call', name: e.name, args };
+      if (VECTOR_OPS.has(e.name)) return vectorCalculus(e.name, args, ctx);
+      if (CURVE_OPS.has(e.name)) return curveGeometry(e.name, args, ctx);
+      if (SURFACE_OPS.has(e.name)) return surfaceGeometry(e.name, args, ctx);
+      if (e.name === 'geodesic')
+        throw new Error(
+          'geodesic(S, (u0, v0), (du, dv)) draws a curve, so it must be the whole row — on a panel drawn on a surface, geodesic(P, (dx, dy)).',
+        );
+      if (e.name === 'fourier' || e.name === 'reconstruct') {
+        const params = ctx.opts.params;
+        const opts: ResolveOpts = params?.size
+          ? {
+              ...ctx.opts,
+              consts: new Proxy(ctx.opts.consts ?? {}, {
+                get: (target, name, receiver) =>
+                  typeof name === 'string' && params.has(name) ? undefined : Reflect.get(target, name, receiver),
+              }),
+              getList: n => (params.has(n) ? null : (ctx.opts.getList?.(n) ?? null)),
+              definition: n => (params.has(n) ? undefined : ctx.opts.definition?.(n)),
+            }
+          : ctx.opts;
+        let signal = args[0];
+        // A function is read over an interval its caller names, not over an
+        // x the document never wrote: f(interval(0, 1)).
+        if (signal?.kind === 'var' && !params?.has(signal.name) && getFn(signal.name))
+          throw new Error(
+            `${e.name} reads a signal over an interval, which sets its period: ${e.name}(${signal.name}(interval(0, 1))${e.name === 'reconstruct' ? ', N' : ''}).`,
+          );
+        // Coordinate fields can name a signal too. Scalar constants remain
+        // names so list lowering records every numeric dependency it reads.
+        if (signal) signal = throughFields(signal, opts, SPACE);
+        // Finish the numeric transform before a containing user function is
+        // inlined: g(x) = reconstruct(f, N); g(2x) scales the finished
+        // approximation, not the signal's sampling variable and interval.
+        return lowerLists(
+          { kind: 'call', name: e.name, args: signal ? [signal, ...args.slice(1)] : args },
+          opts.getList ?? (() => null),
+          opts,
+          true,
+        );
+      }
+      // Keyed by the source node: a function body inlined twice holds the
+      // same literal, and `f(interval(0, 1))` hands one to every use of x.
+      if (e.name === 'interval') return hiddenInterval(e, args);
+      if (e.name === 'clamp') {
+        // clamp(x, lo, hi) ≡ min(max(x, lo), hi): every backend already runs those.
+        if (args.length !== 3) throw new Error('clamp takes three arguments: clamp(x, lo, hi).');
+        const [x, lo, hi] = args;
+        return { kind: 'call', name: 'min', args: [{ kind: 'call', name: 'max', args: [x, lo] }, hi] };
+      }
+      if (
+        ctx.opts.inDefinition &&
+        (e.name === 'trail' ||
+          e.name === 'label' ||
+          e.name === 'revolve' ||
+          e.name === 'rgb' ||
+          e.name === 'hsl' ||
+          e.name === 'oklch')
+      ) {
+        throw new Error(`${e.name}(…) must be a whole row, not part of a definition.`);
+      }
+      if (e.name === 'revolve' && args.length >= 1 && args.length <= 2) {
+        // revolve(f) names the profile by its function: f stands for f(x), or
+        // f(y) / f(z) about the axis asked for. classify (lib/plot.ts) checks
+        // the rest — it sees only the ordinary expression.
+        const [f, ax] = args;
+        const profile = f.kind === 'var' ? getFn(f.name) : undefined;
+        if (f.kind === 'var' && profile) {
+          const axis = revolveAxis(ax);
+          if (profile.params.length !== 1) {
+            throw new Error(
+              `revolve(${f.name}) needs a function of one variable; ${f.name} takes ${profile.params.length}.`,
+            );
+          }
+          const body = substVars(profile.body, { [profile.params[0]]: { kind: 'var', name: axis } });
+          return { kind: 'call', name: e.name, args: [body, ...args.slice(1)] };
+        }
+        // Only the bare name stands for its function; inside a larger profile
+        // (-f, 2f) it has to be called.
+        for (const v of freeVars(f)) {
+          if (getFn(v)) throw new Error(`${v} is a function — write it with parentheses, e.g. ${v}(x).`);
+        }
+      }
+      return { kind: 'call', name: e.name, args };
+    }
+    case 'eq':
+      return { kind: 'eq', l: rx(e.l, ctx), r: rx(e.r, ctx) };
+    case 'ineq':
+      return { ...e, l: rx(e.l, ctx), r: rx(e.r, ctx) };
+    case 'vec':
+      return { kind: 'vec', items: e.items.map(x => rx(x, ctx)) };
+    case 'list':
+      return sameList(e, {
+        kind: 'list',
+        // `[1..10]` ranges survive resolution intact (bounds resolve) and
+        // expand later in list lowering, where constant values are known.
+        items: e.items.map((x): Expr =>
+          x.kind === 'range' ? { kind: 'range', args: [rx(x.args[0], ctx), rx(x.args[1], ctx)] } : rx(x, ctx),
+        ),
+      });
+    case 'data':
+    case 'str':
+    case 'text':
+      return e;
+    case 'piecewise':
+      for (const c of e.cases) {
+        // A lattice row may test equality, and so may a function body for
+        // the lattice rows that call it (life(c, s) = {s = 3: 1, …}); the
+        // lattice rewrites the case (lib/automaton.ts exactCases), and any
+        // other row inlining it fails to compile.
+        if (c.cond.kind === 'eq' && !ctx.opts.inDefinition && !ctx.opts.exactConditions)
+          throw new Error(
+            'A condition like y = x^2 is a filter for a reduction, like count({y = x^2, 0 < x < 1}); piecewise conditions are inequalities.',
+          );
+      }
+      // (A bare condition stays marked: a reduction reads {c1, c2: f} as a
+      // filter, and a function may hand one to it.)
+      return {
+        kind: 'piecewise',
+        cases: e.cases.map(c => ({
+          ...c,
+          cond: namedCondition(c.cond, rx(c.cond, ctx), ctx),
+          value: rx(c.value, ctx),
+        })),
+        otherwise: e.otherwise && rx(e.otherwise, ctx),
+      };
+    case 'loop':
+      return mapChildren(e, x => rx(x, ctx));
+  }
+}
+
+export interface BuiltDefs {
+  defs: Env;
+  fits: Map<string, FitResult>;
+  /** Per-definition errors by defKey; failed definitions are excluded from defs. */
+  errors: Map<string, string>;
+  /** Of those, the ones that failed only because a data file is not on this
+   *  device — the app turns their message into a file picker. */
+  needsFile: Set<string>;
+  /** Constants referenced by Σ/Π bounds (the UI snaps their sliders to integers). */
+  sumBoundConsts: Set<string>;
+}
+
+/**
+ * Look up the bytes behind an `open(…)` row. Omitted (the worker, tests)
+ * means no device data at all: the row still defines a table, but one whose
+ * columns report themselves as device-local rather than missing.
+ */
+export type TableSource = (d: { file: string; hash: string }) => Table | null;
+
+/** Parse and resolve a set of uniquely named definitions. */
+export function buildDefs(raw: Definition[], tables?: TableSource, sequences: SeqScan[] = []): BuiltDefs {
+  const fits = new Map<string, FitResult>();
+  const fittedNames = new Set<string>();
+  const fitOwner = new Map<string, string>();
+  const errors = new Map<string, string>();
+  const needsFile = new Set<string>();
+  const defs = emptyDraft();
+  // The first row defining a letter is its sequence; analysis reports the rest.
+  for (const scan of sequences) if (!defs.sequences.has(scan.name)) defs.sequences.set(scan.name, scan);
+  while (raw.some(d => d.name.startsWith(defs.sequencePrefix + '_'))) defs.sequencePrefix += 'X';
+  const byName = new Map(raw.map(d => [d.name, d]));
+  const fnNames = new Set(raw.filter(d => d.kind === 'fn').map(d => d.name));
+  const stateNames = new Set(raw.filter(d => d.kind === 'state').map(d => d.name));
+  // Names this document binds as values shadow a late-addition builtin of the
+  // same name, so `total = 3` still reads `total(x + 1)` as a product.
+  const valueNames = shadowedNames(raw.filter(d => d.kind !== 'fn').map(d => d.name));
+  const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+  // Numeric values of constants resolved so far: Σ/Π bounds in later
+  // definitions may use them (bounds need a value at expansion time).
+  const numEnv: Record<string, number> = {};
+  const ropts: ResolveOpts = {
+    valueNames,
+    inDefinition: true,
+    consts: numEnv,
+    boundConsts: new Set(),
+    // Live: list names accumulate as definitions are processed.
+    isList: n => isListName(listNamesOf(defs), n),
+    getList: listGetter(defs),
+    indexIssue: (idx, target) => indexIssue(idx, defs, target),
+    // Live too: definitions above this one (a point's components included).
+    // A state stands for itself: defined, and constant across space.
+    definition: n =>
+      defs.conditions.get(n) ?? defs.consts.get(n) ?? (stateNames.has(n) ? { kind: 'var', name: n } : undefined),
+    comps: n => compsOf(defs, n),
+    documentNames: new Set(byName.keys()),
+    interval: n => defs.intervals.get(n),
+    multivector: n => defs.multivectors.get(n),
+    complex: n => defs.complexes.get(n),
+  };
+
+  const parsed = new Map<string, Expr>();
+  // List names accumulate in definition order, so `L[2]` indexes only when
+  // L's list definition sits above (below, it parses as multiplication and
+  // is reported as a forward reference after the loop).
+  const parse = (d: Definition & { rhs: string }): Expr => {
+    const key = defKey(d);
+    let p = parsed.get(key);
+    // A function's parameters are values in its body, f(frame) = frame(2),
+    // and index too, p[2], since an argument may be a tuple or a multiset of
+    // them (docs/multisets.md §3).
+    if (!p) {
+      const values = d.kind === 'fn' ? new Set([...valueNames, ...shadowedNames(d.params)]) : valueNames;
+      const names = d.kind === 'fn' ? new Set([...indexNamesOf(defs), ...d.params]) : indexNamesOf(defs);
+      parsed.set(key, (p = parseExpr(d.rhs, fnNames, names, values)));
+    }
+    return p;
+  };
+
+  /** Derived point component → the point row it belongs to (A_x → A). */
+  const compOwner = new Map<string, string>();
+
+  const resolving: string[] = [];
+  const getFn: GetFn = name => {
+    const hit = defs.fns.get(name);
+    if (hit) return hit;
+    if (!fnNames.has(name)) return undefined;
+    if (errors.has(name)) throw new Error(`${name} has an error in its definition.`);
+    const d = byName.get(name) as Definition & { kind: 'fn' };
+    if (resolving.includes(name)) {
+      if (resolving[resolving.length - 1] !== name)
+        throw new Error(`${name} and ${resolving[resolving.length - 1]} are defined in terms of each other.`);
+      return { params: d.params, body: { kind: 'call', name: RECUR, args: [] }, recursive: true };
+    }
+    resolving.push(name);
+    try {
+      // A parameter shadows a named interval of the same name, and a
+      // built-in unit vector: f(e_x) = e_x^2 squares its argument.
+      const scope: ResolveOpts = {
+        ...ropts,
+        interval: n => (d.params.includes(n) ? undefined : ropts.interval?.(n)),
+        multivector: n => (d.params.includes(n) ? undefined : ropts.multivector?.(n)),
+        complex: n => (d.params.includes(n) ? undefined : ropts.complex?.(n)),
+        documentNames: ropts.documentNames && new Set([...ropts.documentNames, ...d.params]),
+        params: new Set(d.params),
+      };
+      let body = resolveExpr(parse(d), getFn, scope);
+      if (containsRecur(body)) body = wrapRecursion(name, d.params, body);
+      const fn: FnDef = { params: d.params, body };
+      defs.fns.set(name, fn);
+      return fn;
+    } finally {
+      resolving.pop();
+    }
+  };
+  ropts.sequenceTerm = sequenceResolver(
+    defs,
+    getFn,
+    ropts,
+    new Set(raw.map(d => d.name)),
+    new Set(raw.map(d => d.name)),
+    (name, expr) => defs.consts.set(name, expr),
+  );
+
+  // Named conditions (`within = r < R`), found before anything else
+  // resolves: a reduction in a function body reads one by its shape, and
+  // that must not depend on whether the condition's row is above the
+  // function's or below. The loop below settles each one (a comparison over
+  // a list is the list it keeps). Parsed afresh, not cached: list names
+  // that decide indexing are only known in definition order.
+  for (const d of raw) {
+    if (d.kind !== 'const' || d.draw) continue;
+    try {
+      const source = parseExpr(d.rhs, fnNames, indexNamesOf(defs), valueNames);
+      if (source.kind === 'ineq') defs.conditions.set(d.name, resolveExpr(source, getFn, ropts));
+    } catch {
+      /* reported where the loop below resolves it */
+    }
+  }
+
+  // Resolved right-hand sides of `a' = …` and `a(0) = …`, validated below
+  // once the constant/field split is known.
+  const derivs = new Map<string, Expr>();
+  /**
+   * A named value's coefficients as constants of their own (docs/frame-
+   * constants-plan.md): `M = motor(L, t, 1)` stores each coefficient that
+   * depends only on constants, states and t as a hidden constant `M#k`,
+   * evaluated once per frame like a named point's components, and the value
+   * written into rows refers to it — so algebra over it multiplies names, not
+   * formulas. A number or a single name stays as it is (a literal 0 is a
+   * structural zero kinds depend on), as does a coefficient of numbers
+   * alone, and anything over a list, a data column or an interval.
+   */
+  const frameConstant = (e: Expr): boolean => {
+    if (e.kind === 'num' || e.kind === 'var') return false;
+    let plain = true;
+    (function walk(n: Expr): void {
+      if (!plain) return;
+      if (n.kind === 'list' || n.kind === 'data' || n.kind === 'lazy' || n.kind === 'range') plain = false;
+      else childrenOf(n).forEach(walk);
+    })(e);
+    if (!plain) return false;
+    // A coefficient of numbers alone (-0.2) folds where it is: nothing to share.
+    const names = freeVars(e);
+    if (!names.size) return false;
+    for (const v of names) if (v !== 't' && !defs.consts.has(v) && !derivs.has(v)) return false;
+    return true;
+  };
+  let hidden = 0;
+  const hoist = (owner: string, e: Expr): Expr => {
+    if (!frameConstant(e)) return e;
+    const name = `${owner}#${hidden++}`;
+    defs.consts.set(name, e);
+    return { kind: 'var', name };
+  };
+  /** A `[pga]` or `[mv]` node with its coefficients (after the two tags) hoisted. */
+  const hoistNode = (owner: string, e: Expr): Expr =>
+    e.kind === 'call' ? { ...e, args: e.args.map((a, k) => (k < 2 ? a : hoist(owner, a))) } : e;
+  const inits = new Map<string, Expr>();
+
+  for (const d of raw) {
+    try {
+      if (d.kind === 'regression') {
+        const lhsSource = parseExpr(d.lhs, fnNames, indexNamesOf(defs), valueNames);
+        const rhsSource = parseExpr(d.rhs, fnNames, indexNamesOf(defs), valueNames);
+        parsed.set(defKey(d), { kind: 'eq', l: lhsSource, r: rhsSource });
+        const lhs = resolveExpr(lhsSource, getFn, ropts),
+          rhs = resolveExpr(rhsSource, getFn, ropts);
+        const rhsVars = freeVars(rhs);
+        // Points first, as in a plot row: `Y ~ g(A) X + b` reads g at the point A.
+        const points = (e: Expr): Expr =>
+          lowerGeom(
+            e,
+            n => compsOf(defs, n),
+            n => defs.mats.get(n) ?? null,
+            n => getList(n) !== null,
+          );
+        const parameters = [...rhsVars].filter(
+          n => nameable(n) && !byName.has(n) && !draftNameTaken(defs, n) && !n.includes('.'),
+        );
+        if (!parameters.length)
+          throw new Error('Regression needs an unbound coefficient, like Y ~ m X + b. Defined constants stay fixed.');
+        if (parameters.length > 8) throw new Error('Regression supports at most 8 fitted coefficients.');
+        for (const n of rhsVars) {
+          if (RESERVED.has(n) || stateNames.has(n))
+            throw new Error(`Regression models must be static; ${n} cannot vary during a fit.`);
+        }
+        const getList = listGetter(defs);
+        const numericList = (e: Expr): number[] => {
+          if (e.kind === 'data') return Array.from(e.values);
+          if (e.kind !== 'list') throw new Error('Regression observations must be a numeric list, like Y ~ m X + b.');
+          return e.items.map(it => {
+            for (const n of freeVars(it)) {
+              if (!(n in numEnv)) throw new Error(`Regression data must be static; define ${n} above the fit.`);
+            }
+            return evaluate(it, numEnv);
+          });
+        };
+        try {
+          const observed = numericList(lowerLists(points(lhs), getList, ropts));
+          if (observed.length > 10_000)
+            throw new Error('Regression supports at most 10000 observations; filter the data first.');
+          // Keep model arithmetic symbolic even for typed CSV columns. The
+          // usual fast path folds ln(-1) into NaN; a fit must distinguish an
+          // invalid model from a missing input pair instead of dropping it.
+          const model = lowerLists(
+            points(rhs),
+            n => {
+              const value = getList(n);
+              if (value?.kind !== 'data') return value;
+              if (value.values.length > 10_000)
+                throw new Error('Regression supports at most 10000 observations; filter the data first.');
+              return withAxes(
+                { kind: 'list', items: Array.from(value.values, v => ({ kind: 'num', value: v })) },
+                axesOf(value),
+              );
+            },
+            ropts,
+          );
+          const models =
+            model.kind === 'list'
+              ? model.items
+              : model.kind === 'data'
+                ? Array.from(model.values, (value): Expr => ({ kind: 'num', value }))
+                : Array.from({ length: observed.length }, () => model);
+          for (const f of models)
+            for (const n of freeVars(f)) {
+              if (parameters.includes(n)) continue;
+              if (!(n in numEnv)) throw new Error(`Regression models must be static; define ${n} above the fit.`);
+            }
+          const fit = fitRegression(observed, models, parameters, numEnv);
+          fits.set(d.name, fit);
+          for (const [name, value] of Object.entries(fit.coefficients)) {
+            defs.consts.set(name, { kind: 'num', value });
+            numEnv[name] = value;
+            fittedNames.add(name);
+            fitOwner.set(name, d.name);
+          }
+        } catch (err) {
+          if (err instanceof MissingDataError) {
+            for (const name of parameters) defs.missingData.set(name, { message: err.message, list: false });
+          }
+          throw err;
+        }
+      } else if (d.kind === 'fn') {
+        if (new Set(d.params).size !== d.params.length) throw new Error('Duplicate parameter names.');
+        getFn(d.name);
+      } else if (d.kind === 'table') {
+        // The data itself never comes from the document, so there is nothing
+        // to resolve: look the file up and register its columns as lists.
+        const data = tables ? tables(d) : null;
+        // Registered even when the bytes are missing, so the rows that read
+        // its columns report the file rather than "unknown variable".
+        const named = d.hash ? `${d.file} (${shortHash(d.hash)})` : d.file;
+        const missing = data
+          ? undefined
+          : tables
+            ? `${named} is not on this device — drop the file here to load it.`
+            : `${named} is not on this device — its data does not travel in the link.`;
+        defs.tables.set(d.name, { file: d.file, hash: d.hash, data, missing });
+        if (missing && tables) throw new MissingDataError(missing);
+      } else if (d.kind === 'state') {
+        derivs.set(d.name, resolveExpr(parse(d), getFn, ropts));
+      } else if (d.kind === 'init') {
+        inits.set(d.name, resolveExpr(parse(d), getFn, ropts));
+      } else {
+        // Lowering expands point arithmetic; a pair result names a point.
+        // Point-ness flows in definition order, so `C = B + D` needs B and D
+        // defined above (a stray point name below is reported after the loop).
+        const resolved = resolveExpr(parse(d), getFn, ropts);
+        defs.conditions.delete(d.name);
+        // `r = interval(1, 2)`, or anything built from one: not a number but a
+        // hidden parameter, which every row using the name shares.
+        // A binder draws from a list; the other named values below are not one.
+        const notDrawn = (what: string): void => {
+          if (d.draw) throw new Error(`${d.name} ∈ … draws from a list; that is ${what}.`);
+        };
+        // u and v take only an interval: the range they run over.
+        if (PARAMS.has(d.name) && !(resolved.kind === 'call' && resolved.name === INTERVAL))
+          throw new Error(
+            `${d.name} can only be defined as an interval, the range it runs over: ${d.name} = interval(0, 2pi).`,
+          );
+        if (hasInterval(resolved)) {
+          notDrawn('an interval');
+          defs.intervals.set(d.name, resolved);
+          continue;
+        }
+        // `M = ((a, b), (c, d))`, `R = e^(a J)`, `N = 2 M`: a tuple of rows,
+        // or matrix algebra, names a matrix.
+        const isList = (n: string) => defs.lists.has(n);
+        // M Q with Q a multiset of points is those points moved, never a
+        // matrix: the object expansion below applies M to each.
+        const ofPoints = [...freeVars(resolved)].some(n => {
+          const l = defs.lists.get(n);
+          return l?.kind === 'list' && l.items[0]?.kind === 'vec';
+        });
+        const computed =
+          !ofPoints &&
+          lowerMatrix(
+            resolved,
+            n => compsOf(defs, n),
+            n => defs.mats.get(n) ?? null,
+            tensorGetter(defs),
+            isList,
+          );
+        if (computed) {
+          notDrawn('a matrix');
+          defs.mats.set(
+            d.name,
+            computed.map(row => row.map(c => hoist(d.name, c))),
+          );
+          continue;
+        }
+        // `T = e_x ⊗ e_y ⊗ e_z`: a tensor of any other shape.
+        const tensor =
+          !ofPoints &&
+          lowerTensorValue(
+            resolved,
+            n => compsOf(defs, n),
+            n => defs.mats.get(n) ?? null,
+            tensorGetter(defs),
+            isList,
+          );
+        if (tensor) {
+          notDrawn('a tensor');
+          defs.tensors.set(d.name, { ...tensor, data: tensor.data.map(c => hoist(d.name, c)) });
+          continue;
+        }
+        let e: Expr;
+        try {
+          if (ofPoints) throw new Error('points');
+          // (A slerp's intermediates become hidden constants of this name too.)
+          e = withHoisting(
+            c => hoist(d.name, c),
+            () =>
+              lowerLineValue(
+                resolved,
+                n => compsOf(defs, n),
+                n => defs.mats.get(n) ?? null,
+                isList,
+                tensorGetter(defs),
+              ) ??
+              lowerGeom(
+                resolved,
+                n => compsOf(defs, n),
+                n => defs.mats.get(n) ?? null,
+                isList,
+                tensorGetter(defs),
+              ),
+          );
+        } catch {
+          // `N = line(P, A)` over a list names the lines, as join does.
+          const named = resolved.kind === 'call' && resolved.name === 'line' ? { ...resolved, name: 'join' } : resolved;
+          e = lowerObjects(named, defs, ropts, true);
+        }
+        // `X = meet(L, M)` names the point it is; `L = join(A, B)` names a
+        // line, written into every row that names it as a multivector is.
+        const flat = flatOfNode(e);
+        if (flat && isPoint(flat)) e = { kind: 'vec', items: pointCoords(flat) };
+        else if (flat) {
+          notDrawn(`a ${flatName(flat.dim, flat.grade) ?? 'flat'}`);
+          defs.multivectors.set(d.name, hoistNode(d.name, e));
+          continue;
+        }
+        // `R = reflect(Q, L)` over a list of points names those points.
+        if (e.kind === 'list' && e.items.length) {
+          const pts = e.items.map(flatOfNode);
+          if (pts.every(f => f && isPoint(f)))
+            e = sameList(e, { kind: 'list', items: pts.map((f): Expr => ({ kind: 'vec', items: pointCoords(f!) })) });
+        }
+        // `R = e^(-t/2 e_xy)`, `q = quat(1, 2, 3, 4)`: a multivector, written
+        // into every row that names it.
+        if (mvOfNode(e)) {
+          notDrawn('a multivector');
+          defs.multivectors.set(d.name, hoistNode(d.name, e));
+          continue;
+        }
+        // `C = mean((P - m) ⊗ (P - m))`: a reduction over a multiset of
+        // tensors is one tensor, named as a matrix when it is square.
+        const reduced = tensorOfNode(e);
+        if (reduced && reduced.shape.length >= 2) {
+          notDrawn('a tensor');
+          const m = toMat(reduced);
+          if (m) defs.mats.set(d.name, m);
+          else defs.tensors.set(d.name, reduced);
+          continue;
+        }
+        // `adults = person[person.age >= 18]` names a cut of a data file.
+        const cut = filteredTable(e, defs, ropts);
+        if (cut) {
+          notDrawn('a data file; draw one of its columns, p ∈ T.col');
+          defs.tables.set(d.name, cut);
+          // Registered first, so rows below report the file rather than
+          // "unknown variable" — then the row says what is missing, exactly
+          // as the `open()` row it cuts does. Without this the derived table
+          // was the one row in the chain that said nothing: its source asked
+          // for the file and every use of it did too.
+          if (cut.missing && tables) throw new MissingDataError(cut.missing);
+          continue;
+        }
+        e = lowerLists(e, listGetter(defs), ropts, true);
+        // A draw is a choice of its own: A's members over an axis named for
+        // the binder, so `p ∈ A`, `q ∈ A` cross where A and A zip. (A tuple's
+        // positions stay positions.)
+        if (d.draw && (isSeq(e) || isDataScatter(e))) e = drawnFrom(d.name, e);
+        if (isSeq(e)) {
+          // A named data list: scalar elements, or points for a named scatter.
+          // A `data`/`text` value is a list too — a column, or arithmetic over
+          // one — and is stored as it stands rather than expanded.
+          if (e.kind === 'list') {
+            const vecs = e.items.filter((it): it is Expr & { kind: 'vec' } => it.kind === 'vec');
+            if (vecs.length && vecs.length !== e.items.length) {
+              throw new Error('Lists cannot mix numbers and points.');
+            }
+            if (new Set(vecs.map(it => it.items.length)).size > 1) {
+              throw new Error('All points in a list need the same number of coordinates.');
+            }
+          }
+          defs.lists.set(d.name, e);
+          continue;
+        }
+        // `within = r < R`, or another name for one: a condition, written in
+        // wherever a condition reads it (namedCondition, writeConditions).
+        const alias = e.kind === 'var' ? defs.conditions.get(e.name) : undefined;
+        if (e.kind === 'ineq' || alias) {
+          notDrawn('a condition');
+          defs.conditions.set(d.name, alias ?? e);
+          continue;
+        }
+        const store: Array<[string, Expr]> = [[d.name, e]];
+        if (e.kind === 'vec') {
+          // `P = (person.age, person.height)` names a SCATTER, whose
+          // components are whole columns — not a point, whose components are
+          // two numbers. Read as a point it became two `data` components that
+          // then failed to evaluate ("List in scalar context"), so the one
+          // representation that makes a 200 000-row file plottable was also
+          // the one that could not be given a name. The symbolic equivalent
+          // `P = (L, M)` always could.
+          if (isDataScatter(e)) {
+            defs.lists.set(d.name, e);
+            continue;
+          }
+          if (e.items.length !== 2 && e.items.length !== 3) throw new Error('A named point needs 2 or 3 components.');
+          const comps = pointComps(d.name, e.items.length);
+          for (const c of comps) {
+            if (byName.has(c)) {
+              throw new Error(`Cannot name a point ${d.name}: ${c} is already defined.`);
+            }
+          }
+          defs.points.add(d.name);
+          defs.pointDims.set(d.name, e.items.length);
+          store.length = 0;
+          comps.forEach((c, k) => {
+            compOwner.set(c, d.name);
+            store.push([c, e.items[k]]);
+          });
+        }
+        for (const [name, expr] of store) {
+          defs.consts.set(name, expr);
+          try {
+            const env: Record<string, number> = {};
+            for (const fv of freeVars(expr)) {
+              if (!(fv in numEnv)) throw new Error('not static');
+              env[fv] = numEnv[fv];
+            }
+            const v = evaluate(expr, env);
+            if (isFinite(v)) numEnv[name] = v;
+          } catch {
+            /* time-dependent or forward-referencing: Σ bounds can't use it */
+          }
+        }
+      }
+    } catch (e) {
+      errors.set(defKey(d), msg(e));
+      if (e instanceof MissingDataError) {
+        needsFile.add(defKey(d));
+        // The name still means something — a value whose file is elsewhere.
+        // Registered so rows below report the file too, instead of "ages is
+        // not defined", which sends the reader looking for a typo.
+        //
+        // Whether it is a LIST is read off the shape, the same way a filter's
+        // is: `ages = person.age / 2` is one, `avg = mean(person.age)` is a
+        // number. Calling a scalar a list would make it index here and
+        // multiply on the device that has the bytes.
+        if (d.kind === 'const') {
+          const shape = parsed.get(defKey(d));
+          defs.missingData.set(d.name, {
+            message: e.message,
+            list: shape ? staysList(shape, defs) : false,
+          });
+        }
+      }
+    }
+  }
+
+  // A condition named below a definition that reads it (an alias, `big =
+  // within`, is only known when its row is): written in now, as it is above
+  // — in condition places only: a definition that is a condition already
+  // moved to defs.conditions, and one read as a number is reported below.
+  if (defs.conditions.size) {
+    const write = (e: Expr): Expr => writeConditions(e, n => defs.conditions.get(n), false);
+    for (const [name, e] of defs.consts) defs.consts.set(name, write(e));
+    for (const [name, e] of derivs) derivs.set(name, write(e));
+    for (const [name, e] of inits) inits.set(name, write(e));
+  }
+
+  // A bare point name surviving in a resolved expression means the point was
+  // defined below its use, so lowering saw it as a scalar: report and drop.
+  for (const [name, e] of [...defs.consts]) {
+    for (const fv of freeVars(e)) {
+      if (!defs.points.has(fv)) continue;
+      const owner = compOwner.get(name) ?? name;
+      errors.set(owner, `${fv} is a point — move its definition above ${owner}.`);
+      if (defs.points.has(owner)) {
+        defs.points.delete(owner);
+        for (const c of pointComps(owner, defs.pointDims.get(owner))) defs.consts.delete(c);
+      } else {
+        defs.consts.delete(owner);
+      }
+      break;
+    }
+  }
+
+  // Vector states: a state whose derivative (or starting value) lowers to a
+  // 2- or 3-vector integrates componentwise. The base name splits into the
+  // scalar states om_1, om_2(, om_3) — the integrator and everything below
+  // it see only those — and the name itself expands to its components
+  // wherever expressions lower, exactly as a point name does, so `th' = om`
+  // and `segment((0, 0), om)` both work.
+  const vecOwnerKey = new Map<string, string>();
+  /** Starting values per run of a state family, by owner and component. */
+  const familyInits = new Map<string, (readonly Expr[])[]>();
+  /** Owners whose starting values are a tuple: their runs are in order, so
+   *  `p[1]` is the first run (docs/multisets.md §3). */
+  const orderedInits = new Set<string>();
+  /** A family run's hidden scalar state → the row that defines it. */
+  const familyOwner = new Map<string, string>();
+  {
+    // Dims propagate (`th' = om` is scalar until om's own row makes om a
+    // vector), so discovery iterates to a fixed point. Lowering failures
+    // wait for the final pass below, where they are reported per row.
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const [name, e] of [...derivs, ...inits]) {
+        if (defs.vecStates.has(name)) continue;
+        try {
+          const low = lowerGeom(
+            e,
+            n => compsOf(defs, n),
+            n => defs.mats.get(n) ?? null,
+          );
+          if (low.kind === 'vec') {
+            defs.vecStates.set(name, low.items.length);
+            changed = true;
+          }
+        } catch {
+          /* reported below */
+        }
+      }
+    }
+
+    // Final pass: lower every derivative and starting value against the full
+    // component map, split vector ones, and swap the scalar results in.
+    const flatDerivs = new Map<string, Expr>();
+    const flatInits = new Map<string, Expr>();
+    for (const [name, e] of derivs) {
+      try {
+        const low = lowerGeom(
+          e,
+          n => compsOf(defs, n),
+          n => defs.mats.get(n) ?? null,
+        );
+        const dim = defs.vecStates.get(name);
+        if (dim === undefined) {
+          flatDerivs.set(name, low);
+          continue;
+        }
+        if (low.kind !== 'vec' || low.items.length !== dim) {
+          const got = low.kind === 'vec' ? `${low.items.length} components` : 'a single number';
+          throw new Error(`${name} is a ${dim}-component state, but ${name}' has ${got}.`);
+        }
+        const comps = vecStateComps(name, dim);
+        for (const c of comps) {
+          if (byName.has(c)) throw new Error(`Cannot make ${name} a vector state: ${c} is already defined.`);
+        }
+        comps.forEach((c, k) => {
+          flatDerivs.set(c, (low as Expr & { kind: 'vec' }).items[k]);
+          vecOwnerKey.set(c, name);
+        });
+      } catch (err) {
+        defs.vecStates.delete(name);
+        errors.set(name, msg(err));
+      }
+    }
+    for (const [name, e] of inits) {
+      const rowKey = `${name}(0)`;
+      try {
+        const low = lowerGeom(
+          e,
+          n => compsOf(defs, n),
+          n => defs.mats.get(n) ?? null,
+        );
+        const dim = defs.vecStates.get(name);
+        // A list of starting values is a family: one run of the system each.
+        const listed = lowerLists(low, listGetter(defs), ropts, true);
+        if (isSeq(listed)) {
+          if (listed.kind !== 'list') throw new Error(`${name}(0) must list numbers${dim ? ' or points' : ''}.`);
+          const members = listed.items.map(it => {
+            if (dim === undefined) {
+              if (it.kind === 'vec') throw new Error(`${name}(0) lists points, but ${name} is a single number.`);
+              return [it];
+            }
+            if (it.kind !== 'vec' || it.items.length !== dim) {
+              throw new Error(
+                `${name} is a ${dim}-component state, but ${name}(0) lists ${it.kind === 'vec' ? `${it.items.length}-component points` : 'single numbers'}.`,
+              );
+            }
+            return it.items;
+          });
+          if (!members.length) throw new Error(`${name}(0) is an empty list.`);
+          if (members.length > FAMILY_MAX)
+            throw new Error(`${name}(0) starts ${members.length} runs — the limit is ${FAMILY_MAX}.`);
+          familyInits.set(name, members);
+          if (isTuple(listed)) orderedInits.add(name);
+          const comps = dim === undefined ? [name] : vecStateComps(name, dim);
+          comps.forEach((c, k) => {
+            flatInits.set(c, members[0][k]);
+            if (dim !== undefined) vecOwnerKey.set(c, name);
+          });
+          continue;
+        }
+        if (dim === undefined) {
+          if (low.kind === 'vec')
+            throw new Error(`${name}(0) has ${low.items.length} components, but ${name} is a single number.`);
+          flatInits.set(name, low);
+          continue;
+        }
+        if (low.kind !== 'vec' || low.items.length !== dim) {
+          const got = low.kind === 'vec' ? `has ${low.items.length} components` : 'is a single number';
+          throw new Error(`${name} is a ${dim}-component state, but ${name}(0) ${got}.`);
+        }
+        vecStateComps(name, dim).forEach((c, k) => {
+          flatInits.set(c, (low as Expr & { kind: 'vec' }).items[k]);
+          vecOwnerKey.set(c, name);
+        });
+      } catch (err) {
+        errors.set(rowKey, msg(err));
+      }
+    }
+    derivs.clear();
+    for (const [k, v] of flatDerivs) derivs.set(k, v);
+    inits.clear();
+    for (const [k, v] of flatInits) inits.set(k, v);
+    // Downstream validation runs over the scalar components.
+    stateNames.clear();
+    for (const k of derivs.keys()) stateNames.add(k);
+  }
+
+  // State families: `p(0) = ([0..99]/10, 0, 0)` runs the system once per
+  // starting value. Each run is its own set of hidden scalar states, so the
+  // integrator is unchanged, and the state's names become lists over one
+  // shared axis — `p` draws as a point per run, `p[1]` is the first run. A
+  // state coupled to a family (`r' = vel` with a list of r(0)) runs per
+  // member too, seeded from its own single starting value.
+  if (familyInits.size) {
+    const rowOf = (c: string) => vecOwnerKey.get(c) ?? c;
+    const compsOfState = (owner: string) => {
+      const dim = defs.vecStates.get(owner);
+      return dim === undefined ? [owner] : vecStateComps(owner, dim);
+    };
+    // Constants that read a state are inlined into each run's derivative:
+    // `f = (…th_1…)` means a different f per run.
+    const stateDependent = new Map<string, Expr>();
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const [n, e] of defs.consts) {
+        if (stateDependent.has(n)) continue;
+        if ([...freeVars(e)].some(v => stateNames.has(v) || stateDependent.has(v))) {
+          stateDependent.set(n, e);
+          changed = true;
+        }
+      }
+    }
+    const inline = (e: Expr): Expr => {
+      for (let depth = 0; depth <= stateDependent.size; depth++) {
+        const hit = [...freeVars(e)].filter(v => stateDependent.has(v));
+        if (!hit.length) return e;
+        e = substVars(e, Object.fromEntries(hit.map(v => [v, stateDependent.get(v)!])));
+      }
+      return e; // a cycle: validation below reports it on the constant
+    };
+    // Coupled states run together, so they share one family.
+    const parent = new Map<string, string>();
+    const find = (a: string): string => {
+      const p = parent.get(a) ?? a;
+      if (p === a) return a;
+      const root = find(p);
+      parent.set(a, root);
+      return root;
+    };
+    const inlined = new Map([...derivs].map(([c, d]) => [c, inline(d)]));
+    for (const [c, d] of inlined) {
+      for (const fv of freeVars(d)) if (stateNames.has(fv)) parent.set(find(rowOf(c)), find(rowOf(fv)));
+    }
+    const sizes = new Map<string, { n: number; from: string }>();
+    for (const [owner, members] of familyInits) {
+      const root = find(owner),
+        seen = sizes.get(root);
+      if (!seen) sizes.set(root, { n: members.length, from: owner });
+      else if (seen.n !== members.length) {
+        errors.set(
+          `${owner}(0)`,
+          `${owner}(0) starts ${members.length} runs, but ${seen.from}(0), which it moves with, starts ${seen.n}.`,
+        );
+        familyInits.delete(owner);
+      }
+    }
+    const owners = new Set([...derivs.keys()].map(rowOf));
+    for (const [root, { n }] of sizes) {
+      const group = [...owners].filter(o => find(o) === root);
+      const comps = group.flatMap(compsOfState).filter(c => derivs.has(c));
+      const hidden = (c: string, k: number) => `${defs.sequencePrefix}_run_${c}_${k}`;
+      const inOrder = group.every(o => !familyInits.has(o) || orderedInits.has(o));
+      const axes = [{ id: `${root}#runs`, n, ...(inOrder ? { ordered: true as const } : {}) }];
+      const runs = Array.from({ length: n }, (_, k) =>
+        Object.fromEntries(comps.map(c => [c, { kind: 'var', name: hidden(c, k) } as Expr])),
+      );
+      for (const owner of group) {
+        const own = compsOfState(owner);
+        const members = familyInits.get(owner);
+        own.forEach((c, i) => {
+          const deriv = inlined.get(c);
+          const init = inits.get(c) ?? num(0);
+          for (let k = 0; k < n; k++) {
+            const h = hidden(c, k);
+            if (deriv) derivs.set(h, substVars(deriv, runs[k]));
+            inits.set(h, members ? members[k][i] : init);
+            stateNames.add(h);
+            familyOwner.set(h, owner);
+          }
+          derivs.delete(c);
+          inits.delete(c);
+          stateNames.delete(c);
+          vecOwnerKey.delete(c);
+          const list: Expr = { kind: 'list', items: runs.map(r => r[c] ?? num(0)) };
+          if (own.length > 1) defs.lists.set(c, withAxes(list, axes));
+        });
+        const list: Expr =
+          own.length > 1
+            ? { kind: 'list', items: runs.map(r => ({ kind: 'vec', items: own.map(c => r[c] ?? num(0)) })) }
+            : { kind: 'list', items: runs.map(r => r[owner] ?? num(0)) };
+        defs.lists.set(owner, withAxes(list, axes));
+        defs.vecStates.delete(owner);
+      }
+    }
+    // A constant reading a family is a list of values, one per run.
+    const familyNames = () => new Set(defs.lists.keys());
+    for (const [n, e] of [...defs.consts]) {
+      const names = familyNames();
+      if (![...freeVars(e)].some(v => names.has(v))) continue;
+      try {
+        const listed = lowerLists(e, listGetter(defs), ropts, true);
+        if (!isSeq(listed)) continue;
+        defs.consts.delete(n);
+        defs.lists.set(n, listed);
+      } catch (err) {
+        errors.set(compOwner.get(n) ?? n, msg(err));
+        defs.consts.delete(n);
+      }
+    }
+    // A point with a component per run is a list of points.
+    for (const owner of [...defs.points]) {
+      const comps = pointComps(owner, defs.pointDims.get(owner));
+      const lists = comps.map(c => defs.lists.get(c));
+      if (!lists.some(Boolean)) continue;
+      const len =
+        lists.find(Boolean)!.kind === 'list' ? (lists.find(Boolean) as Expr & { kind: 'list' }).items.length : 0;
+      const axes = axesOf(lists.find(Boolean) as Seq);
+      const items = Array.from({ length: len }, (_, k): Expr => ({
+        kind: 'vec',
+        items: comps.map((c, i) => {
+          const l = lists[i];
+          return l ? (l as Expr & { kind: 'list' }).items[k] : (defs.consts.get(c) ?? num(0));
+        }),
+      }));
+      for (const c of comps) {
+        defs.consts.delete(c);
+        compOwner.delete(c);
+      }
+      defs.points.delete(owner);
+      defs.pointDims.delete(owner);
+      defs.lists.set(owner, withAxes({ kind: 'list', items }, axes));
+    }
+  }
+
+  // A definition whose value depends on position — x, y, or z, directly or
+  // via another such definition — is a coordinate field, not a constant.
+  // So is one over the parameters u, v: `c = (cos(2pi u), sin(2pi u))`
+  // names a curve that later rows inline, as they inline `s = (x, y)`.
+  const fieldNames = new Set<string>();
+  // A complex constant (`a = e^(iπ/3)`, `c = 2a`) has no one number to hold:
+  // it is written in wherever its name is read (ResolveOpts.complex), as an
+  // interval is. Written into one another they close; a chain that squares as
+  // it goes grows geometrically, so its size is checked before anything
+  // walks it.
+  const sizes = new WeakMap<object, number>();
+  const writeComplex = (e: Expr): Expr => {
+    const refs = [...freeVars(e)].filter(v => defs.complexes.has(v));
+    return refs.length ? substVars(e, Object.fromEntries(refs.map(r => [r, defs.complexes.get(r)!]))) : e;
+  };
+  const tooLarge = (name: string, e: Expr, written: Expr): boolean => {
+    if (written === e || countNodes(written, sizes) <= SPLIT_NODE_BUDGET) return false;
+    errors.set(name, `${name} is too large with its complex constants written in — reduce the nesting or the powers.`);
+    defs.consts.delete(name);
+    return true;
+  };
+  const overNothing = (e: Expr) => ![...freeVars(e)].some(v => onPosition(v) || PARAMS.has(v));
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [name, e] of defs.consts) {
+      const written = writeComplex(e);
+      if (tooLarge(name, e, written)) continue;
+      if (isComplexValued(written) && overNothing(written)) {
+        defs.complexes.set(name, written);
+        defs.consts.delete(name);
+        changed = true;
+      }
+    }
+  }
+  // What reads one is written through: a complex field (`q = w - a`) stays
+  // complex, and a real value (`b = |a|`, `re(e^(iπ/3))`) holds its real part
+  // and stays a constant — a slider bound, a range.
+  for (const [name, e] of defs.consts) {
+    const written = writeComplex(e);
+    if (written === e && !freeVars(e).has('i')) continue;
+    if (tooLarge(name, e, written)) continue;
+    try {
+      defs.consts.set(name, isComplexValued(written) ? written : realValue(written, name));
+    } catch (err) {
+      errors.set(name, msg(err));
+      defs.consts.delete(name);
+    }
+  }
+  for (const [name, l] of defs.lists) {
+    if (l.kind !== 'list') continue;
+    const items = l.items.map(writeComplex);
+    if (items.some((it, k) => it !== l.items[k])) defs.lists.set(name, { ...l, items });
+  }
+  // A condition compares real values: `ok = |a| < 2` reads |a| through its
+  // real part, and `ok = a < 2` has no order to compare.
+  const realSides = (c: Expr, name: string): Expr =>
+    c.kind === 'ineq'
+      ? { ...c, l: realSides(c.l, name), r: realSides(c.r, name) }
+      : realValue(c, `${name}'s comparison`);
+  for (const [name, c] of defs.conditions) {
+    const written = writeComplex(c);
+    if (written === c) continue;
+    try {
+      if (countNodes(written, sizes) > SPLIT_NODE_BUDGET)
+        throw new Error(
+          `${name} is too large with its complex constants written in — reduce the nesting or the powers.`,
+        );
+      defs.conditions.set(name, realSides(written, name));
+    } catch (err) {
+      errors.set(name, msg(err));
+      defs.conditions.delete(name);
+    }
+  }
+  // A function's parameter shadows one, as it does an interval.
+  for (const [name, fn] of defs.fns) {
+    const refs = [...freeVars(fn.body)].filter(v => defs.complexes.has(v) && !fn.params.includes(v));
+    if (refs.length)
+      defs.fns.set(name, {
+        ...fn,
+        body: substVars(fn.body, Object.fromEntries(refs.map(r => [r, defs.complexes.get(r)!]))),
+      });
+  }
+  // The fields over u, v among them, so their errors speak of curves.
+  const paramNames = new Set<string>();
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [name, e] of defs.consts) {
+      for (const fv of freeVars(e)) {
+        if (!fieldNames.has(name) && (onPosition(fv) || PARAMS.has(fv) || fieldNames.has(fv))) {
+          fieldNames.add(name);
+          changed = true;
+        }
+        if (!paramNames.has(name) && (PARAMS.has(fv) || paramNames.has(fv))) {
+          paramNames.add(name);
+          changed = true;
+        }
+      }
+    }
+  }
+  // A named vector that depends on position is a vector field: every
+  // component becomes a coordinate field (`s = (x, y)` is the position
+  // vector). Constant siblings (`A = (x, 0)`) join them so the name stays
+  // one object; they are skipped when drawing grid families.
+  for (const p of [...defs.points]) {
+    const comps = pointComps(p, defs.pointDims.get(p));
+    if (!comps.some(c => fieldNames.has(c))) continue;
+    for (const c of comps) fieldNames.add(c);
+    // `c = (u, w)`: the w component belongs to a curve too.
+    if (comps.some(c => paramNames.has(c))) for (const c of comps) paramNames.add(c);
+  }
+
+  const constNames = new Set(
+    raw
+      .filter(
+        d =>
+          d.kind === 'const' && !fieldNames.has(d.name) && !defs.conditions.has(d.name) && !defs.complexes.has(d.name),
+      )
+      .map(d => d.name),
+  );
+  for (const name of fittedNames) constNames.add(name);
+  for (const name of defs.consts.keys()) if (name.startsWith(defs.sequencePrefix + '_')) constNames.add(name);
+  // A named value's hidden coefficients (M#3) are constants by construction.
+  for (const name of defs.consts.keys()) if (name.includes('#')) constNames.add(name);
+  // Constant point rows resolve to their component constants; a vector
+  // field's components are fields, not uniforms.
+  for (const p of defs.points) {
+    constNames.delete(p);
+    for (const c of pointComps(p, defs.pointDims.get(p))) {
+      if (!fieldNames.has(c)) constNames.add(c);
+    }
+  }
+
+  const pendingFields = new Map<string, Expr>();
+  for (const [name, e] of defs.consts) {
+    if (fieldNames.has(name)) pendingFields.set(name, e);
+  }
+  for (const name of pendingFields.keys()) defs.consts.delete(name);
+
+  // Resolve field-to-field references so each field is a closed expression
+  // in x, y, z, t, and constants.
+  const fieldVisiting = new Set<string>();
+  const resolveField = (name: string): Expr => {
+    const hit = defs.fields.get(name);
+    if (hit) return hit;
+    const shown = compOwner.get(name) ?? name;
+    if (fieldVisiting.has(name)) throw new Error(`${shown} is defined in terms of itself.`);
+    fieldVisiting.add(name);
+    try {
+      let e = pendingFields.get(name)!;
+      const sub: Record<string, Expr> = {};
+      for (const fv of freeVars(e)) {
+        if (pendingFields.has(fv)) sub[fv] = resolveField(fv);
+      }
+      if (Object.keys(sub).length) e = substVars(e, sub);
+      // A field lives over the plane or space, or over the parameters — a
+      // position-dependent curve has no one meaning.
+      const vars = [...freeVars(e)];
+      const param = vars.find(fv => PARAMS.has(fv));
+      if (param && vars.some(onPosition)) {
+        throw new Error(
+          `${shown} mixes position (x, y, z) with the parameter ${param}; a definition may use one or the other (found ${param}).`,
+        );
+      }
+      // A field may be complex: `q = x + iy` names the point w does.
+      for (const fv of vars) {
+        if (
+          !onPosition(fv) &&
+          !PARAMS.has(fv) &&
+          fv !== 't' &&
+          fv !== 'i' &&
+          !constNames.has(fv) &&
+          !stateNames.has(fv)
+        ) {
+          throw new Error(
+            param || paramNames.has(name)
+              ? `${shown} is a curve or surface (it uses u or v), so it may only use u, v, t, and constants (found ${fv}).`
+              : `${shown} defines a coordinate (it uses x, y, or z), so it may only use x, y, z, t, and constants (found ${fv}).`,
+          );
+        }
+      }
+      // Trial-evaluate to surface unsupported calls (re, im, …) now. A
+      // complex field has no real value; the rows using it check it.
+      if (!vars.includes('i') && !vars.includes('w')) {
+        const env: Record<string, number> = { x: 0.7, y: 0.4, z: 0.3, t: 0 };
+        for (const fv of vars) env[fv] ??= 1;
+        evaluate(e, env);
+      }
+      defs.fields.set(name, e);
+      return e;
+    } finally {
+      fieldVisiting.delete(name);
+    }
+  };
+  const droppedPoints = new Set<string>();
+  for (const name of pendingFields.keys()) {
+    const owner = compOwner.get(name);
+    if (owner && droppedPoints.has(owner)) continue;
+    try {
+      resolveField(name);
+    } catch (e) {
+      const shown = owner ?? name;
+      errors.set(shown, msg(e));
+      if (owner && defs.points.has(owner)) {
+        defs.points.delete(owner);
+        droppedPoints.add(owner);
+        for (const c of pointComps(owner, defs.pointDims.get(owner))) defs.fields.delete(c);
+      }
+    }
+  }
+  // The same rule across a named vector's components: `s = (x, u)` has no
+  // one meaning, though each component alone would. Nor has `s = (x, w)`:
+  // a vector's components are real.
+  for (const p of [...defs.points]) {
+    const comps = pointComps(p, defs.pointDims.get(p)).map(c => defs.fields.get(c));
+    if (!comps.every(Boolean)) continue;
+    const vars = comps.flatMap(e => [...freeVars(e!)]);
+    const param = vars.find(fv => PARAMS.has(fv));
+    if (comps.some(e => isComplexValued(e!))) {
+      errors.set(p, `${p} has a complex component; a vector's components are real — take re(…) or im(…).`);
+    } else if (param && vars.some(onPosition)) {
+      errors.set(
+        p,
+        `${p} mixes position (x, y, z) with the parameter ${param}; a definition may use one or the other (found ${param}).`,
+      );
+    } else continue;
+    defs.points.delete(p);
+    for (const c of pointComps(p, defs.pointDims.get(p))) defs.fields.delete(c);
+  }
+  // A binder draws from a list; one over position (or over u, v) is a field
+  // (or a curve), which has no members to draw.
+  for (const d of raw) {
+    if (d.kind !== 'const' || !d.draw) continue;
+    const comps = defs.points.has(d.name) ? pointComps(d.name, defs.pointDims.get(d.name)) : [d.name];
+    if (!comps.some(c => defs.fields.has(c))) continue;
+    const what = comps.some(c => paramNames.has(c)) ? 'a curve' : 'a field';
+    errors.set(d.name, `${d.name} ∈ … draws from a list; that is ${what}.`);
+    defs.points.delete(d.name);
+    for (const c of comps) defs.fields.delete(c);
+  }
+  // Grid families draw in definition order, not dependency-resolution order.
+  const orderedFields = new Map<string, Expr>();
+  for (const name of pendingFields.keys()) {
+    const e = defs.fields.get(name);
+    if (e) orderedFields.set(name, e);
+  }
+  defs.fields = orderedFields;
+
+  // A condition reads fields as a row does: closed over them here, so a row
+  // that writes one in has no field left in it to write. It may use what a
+  // field may, and its sides must evaluate.
+  for (const [name, written] of defs.conditions) {
+    try {
+      const refs = [...freeVars(written)].filter(v => defs.fields.has(v));
+      const c = refs.length ? substVars(written, Object.fromEntries(refs.map(r => [r, defs.fields.get(r)!]))) : written;
+      const vars = [...freeVars(c)];
+      for (const fv of vars) {
+        if (onPosition(fv) || PARAMS.has(fv) || fv === 't' || fv === 'i' || constNames.has(fv) || stateNames.has(fv))
+          continue;
+        throw new Error(
+          defs.conditions.has(fv)
+            ? conditionAsNumber(fv)
+            : `${name} is a condition, so it may only use x, y, z, u, v, t, constants and fields (found ${fv}).`,
+        );
+      }
+      if (!vars.includes('i') && !vars.includes('w')) {
+        const env: Record<string, number> = { x: 0.7, y: 0.4, z: 0.3, t: 0 };
+        for (const fv of vars) env[fv] ??= 1;
+        for (const side of ineqComparisons(c as Expr & { kind: 'ineq' }).flatMap(k => [k.l, k.r])) evaluate(side, env);
+      }
+      defs.conditions.set(name, c);
+    } catch (err) {
+      errors.set(name, msg(err));
+      defs.conditions.delete(name);
+    }
+  }
+
+  // Constants may only depend on other constants, states, and time.
+  for (const [name, e] of defs.consts) {
+    for (const fv of freeVars(e)) {
+      if (fv !== 't' && !constNames.has(fv) && !stateNames.has(fv)) {
+        errors.set(
+          name,
+          fv === 'inf'
+            ? `inf only works as an ∫ bound — write it inline: int[-inf..x] f(x) dx.`
+            : defs.conditions.has(fv)
+              ? conditionAsNumber(fv)
+              : `${name} can only depend on other constants and t (found ${fv}).`,
+        );
+        defs.consts.delete(name);
+        break;
+      }
+    }
+  }
+
+  // A list holds data: its elements may only use constants, states, t and i.
+  // (References to other lists never survive — lowering already inlined
+  // any list defined above, and one defined below parses as a product and
+  // lands in the constant check above.)
+  // (A `data`/`text` list holds numbers and text, so it has no variables to
+  // check — only the symbolic representation can name one.)
+  outer: for (const [name, seq] of defs.lists) {
+    if (seq.kind !== 'list') continue;
+    for (const item of seq.items) {
+      for (const fv of freeVars(item)) {
+        if (fv !== 't' && fv !== 'i' && !constNames.has(fv) && !stateNames.has(fv)) {
+          errors.set(
+            name,
+            defs.conditions.has(fv)
+              ? conditionAsNumber(fv)
+              : `${name} is a list, so its elements may only use constants and t (found ${fv}).`,
+          );
+          defs.lists.delete(name);
+          continue outer;
+        }
+      }
+    }
+  }
+
+  // Trial-evaluate to surface cycles and unsupported calls at definition time.
+  // States are leaves here: the integrator supplies their values, so they
+  // stand in as 0 and never recurse.
+  const check = (name: string, visiting: Set<string>): void => {
+    const e = defs.consts.get(name);
+    // A surviving list (or matrix, tensor, multivector or interval) name means
+    // it was defined below its use, so lowering saw it as a plain scalar.
+    const kind = defs.lists.has(name)
+      ? 'a list'
+      : defs.mats.has(name)
+        ? 'a matrix'
+        : defs.tensors.has(name)
+          ? 'a tensor'
+          : defs.multivectors.has(name)
+            ? 'a multivector'
+            : defs.intervals.has(name)
+              ? 'an interval'
+              : null;
+    if (!e && kind) throw new Error(`${name} is ${kind} — move its definition above where it is used.`);
+    if (!e) throw new Error(errors.has(name) ? `${name} has an error in its definition.` : `${name} is not defined.`);
+    if (visiting.has(name)) throw new Error(`${name} is defined in terms of itself.`);
+    visiting.add(name);
+    const env: Record<string, number> = { t: 0 };
+    for (const fv of freeVars(e)) {
+      if (fv !== 't') {
+        if (!stateNames.has(fv)) check(fv, visiting);
+        env[fv] = 0;
+      }
+    }
+    visiting.delete(name);
+    evaluate(e, env);
+  };
+  const bad = new Set<string>();
+  for (const name of defs.consts.keys()) {
+    try {
+      check(name, new Set());
+    } catch (e) {
+      errors.set(name, msg(e));
+      bad.add(name);
+    }
+  }
+  for (const name of bad) defs.consts.delete(name);
+
+  // States. A derivative sees time, constants, and the other states; an
+  // initial value is read once at reset, so it must be constant. Vector
+  // states validate per scalar component; their errors land on the base row.
+  const stateRow = (n: string): string => vecOwnerKey.get(n) ?? familyOwner.get(n) ?? n;
+  for (const [name, deriv] of derivs) {
+    try {
+      if (defs.fields.has(name))
+        throw new Error(`${name} is a coordinate field — use a tuple flow like (${name}', y') = (F, G).`);
+      if (defs.consts.has(name)) {
+        throw new Error(`${name} is already defined as a constant.`);
+      }
+      const env: Record<string, number> = { t: 0 };
+      for (const fv of freeVars(deriv)) {
+        if (fv !== 't' && !constNames.has(fv) && !stateNames.has(fv)) {
+          throw new Error(
+            `${stateRow(name)}' changes with time, so it may only use t, constants, and other states (found ${fv}).`,
+          );
+        }
+        env[fv] = 0;
+      }
+      evaluate(deriv, env); // surfaces unsupported calls (re, im, …) now
+      let init = inits.get(name) ?? num(0);
+      for (const fv of freeVars(init)) {
+        if (!constNames.has(fv)) {
+          errors.set(
+            `${stateRow(name)}(0)`,
+            `${stateRow(name)}(0) is a starting value, so it must be constant (found ${fv}).`,
+          );
+          init = num(0);
+          break;
+        }
+      }
+      defs.states.set(name, { deriv, init });
+    } catch (e) {
+      errors.set(stateRow(name), msg(e));
+    }
+  }
+  for (const name of inits.keys()) {
+    if (!defs.states.has(name) && !errors.has(stateRow(name)) && !errors.has(`${stateRow(name)}(0)`)) {
+      errors.set(
+        `${stateRow(name)}(0)`,
+        `${stateRow(name)}(0) is a starting value, but ${stateRow(name)}' is not defined.`,
+      );
+    }
+  }
+  // A vector state that lost every component to errors is not a state at all.
+  for (const [name, dim] of defs.vecStates) {
+    if (!vecStateComps(name, dim).every(c => defs.states.has(c))) defs.vecStates.delete(name);
+  }
+
+  // Component validation is atomic at the owner boundary: a failed vector
+  // cannot leave usable scalar aliases behind, or hide its error on an alias.
+  for (const [component, owner] of compOwner) {
+    const error = errors.get(component);
+    if (error) {
+      errors.set(owner, error);
+      errors.delete(component);
+    }
+  }
+  for (const [owner, dimension] of defs.pointDims) {
+    const components = pointComps(owner, dimension);
+    const store = components.some(c => defs.fields.has(c)) ? defs.fields : defs.consts;
+    if (defs.points.has(owner) && components.every(c => store.has(c)) && !errors.has(owner)) continue;
+    defs.points.delete(owner);
+    for (const c of components) {
+      defs.consts.delete(c);
+      defs.fields.delete(c);
+    }
+  }
+  for (const [component, owner] of vecOwnerKey) {
+    if (!defs.vecStates.has(owner) || errors.has(owner)) defs.states.delete(component);
+  }
+
+  // A successful sibling may already have been inlined, folded into a
+  // number, or used to build a table before another component failed. Retain
+  // source dependencies until publication, so no binding can outlive a
+  // failed owner merely because its lowered expression hid that reference.
+  if (errors.size) {
+    const ownerOf = (name: string) =>
+      compOwner.get(name) ?? vecOwnerKey.get(name) ?? familyOwner.get(name) ?? fitOwner.get(name) ?? name;
+    const known = new Set([
+      ...byName.keys(),
+      ...compOwner.keys(),
+      ...vecOwnerKey.keys(),
+      ...fittedNames,
+      ...defs.consts.keys(),
+    ]);
+    const present = (name: string): boolean =>
+      defs.consts.has(name) ||
+      defs.fields.has(name) ||
+      defs.complexes.has(name) ||
+      defs.conditions.has(name) ||
+      defs.states.has(name) ||
+      defs.points.has(name) ||
+      defs.vecStates.has(name) ||
+      defs.fns.has(name) ||
+      defs.mats.has(name) ||
+      defs.tensors.has(name) ||
+      defs.multivectors.has(name) ||
+      defs.intervals.has(name) ||
+      defs.lists.has(name) ||
+      defs.tables.has(name) ||
+      defs.missingData.has(name);
+    const references = (expr: Expr): Set<string> => {
+      const names = sourceFreeVars(expr);
+      const calls = (node: Expr): void => {
+        if (node.kind === 'call' && fnNames.has(node.name)) names.add(node.name);
+        for (const child of childrenOf(node)) calls(child);
+      };
+      calls(expr);
+      return names;
+    };
+    const sourceMemo = new Map<string, ReadonlySet<string>>();
+    const sourceRefs = (name: string): ReadonlySet<string> => {
+      const owner = ownerOf(name);
+      let refs = sourceMemo.get(owner);
+      if (!refs) {
+        const source = parsed.get(owner);
+        const names = source ? references(source) : new Set<string>();
+        const row = byName.get(owner);
+        if (row?.kind === 'fn') for (const param of row.params) names.delete(param);
+        if (row?.kind === 'regression')
+          for (const [parameter, fit] of fitOwner) if (fit === owner) names.delete(parameter);
+        sourceMemo.set(owner, (refs = names));
+      }
+      return refs;
+    };
+    const failedRef = (refs: Iterable<string>): string | undefined => {
+      for (const name of refs) {
+        const head = name.includes('.') ? name.slice(0, name.indexOf('.')) : name;
+        if (known.has(head) && !present(head)) return ownerOf(head);
+      }
+    };
+    const forget = (name: string): void => {
+      defs.consts.delete(name);
+      defs.fields.delete(name);
+      defs.complexes.delete(name);
+      defs.conditions.delete(name);
+      defs.states.delete(name);
+      defs.fns.delete(name);
+      defs.mats.delete(name);
+      defs.tensors.delete(name);
+      defs.multivectors.delete(name);
+      defs.intervals.delete(name);
+      defs.lists.delete(name);
+      defs.tables.delete(name);
+      defs.missingData.delete(name);
+    };
+    const remove = (name: string): void => {
+      const owner = ownerOf(name);
+      if (compOwner.has(name)) {
+        defs.points.delete(owner);
+        // Every store `present` reads: a component left in any of them (a
+        // complex one sits in `complexes`) stays present, and the fixpoint
+        // below would remove it again forever.
+        for (const alias of pointComps(owner, defs.pointDims.get(owner))) forget(alias);
+      } else if (vecOwnerKey.has(name)) {
+        // The dimension map may have been removed by earlier validation.
+        for (const [alias, state] of vecOwnerKey) if (state === owner) defs.states.delete(alias);
+        defs.vecStates.delete(owner);
+      } else if (fitOwner.has(name)) {
+        for (const [parameter, fit] of fitOwner) if (fit === owner) defs.consts.delete(parameter);
+        fits.delete(owner);
+      } else forget(name);
+    };
+    // Runtime formulas and original sources both matter: generated sequence
+    // constants have no source row; inlined fields may have no free names.
+    for (let changed = true; changed;) {
+      changed = false;
+      const candidates: Array<[string, readonly Expr[], readonly string[]]> = [
+        ...[...defs.consts].map(([name, expr]): [string, Expr[], string[]] => [name, [expr], []]),
+        ...[...defs.fields].map(([name, expr]): [string, Expr[], string[]] => [name, [expr], []]),
+        ...[...defs.complexes].map(([name, expr]): [string, Expr[], string[]] => [name, [expr], []]),
+        ...[...defs.conditions].map(([name, expr]): [string, Expr[], string[]] => [name, [expr], []]),
+        ...[...defs.states].map(([name, state]): [string, Expr[], string[]] => [name, [state.deriv], []]),
+        ...[...defs.fns].map(([name, fn]): [string, Expr[], string[]] => [name, [fn.body], fn.params]),
+        ...[...defs.mats].map(([name, matrix]): [string, Expr[], string[]] => [name, matrix.flat(), []]),
+        ...[...defs.tensors].map(([name, tensor]): [string, Expr[], string[]] => [name, [...tensor.data], []]),
+        ...[...defs.multivectors].map(([name, value]): [string, Expr[], string[]] => [name, [value], []]),
+        ...[...defs.intervals].map(([name, value]): [string, Expr[], string[]] => [name, [value], []]),
+        ...[...defs.lists].map(([name, value]): [string, Expr[], string[]] => [name, [value], []]),
+        ...[...defs.tables.keys()].map((name): [string, Expr[], string[]] => [name, [], []]),
+      ];
+      for (const [name, expressions, parameters] of candidates) {
+        if (!present(name)) continue;
+        const refs = new Set(sourceRefs(name));
+        for (const expr of expressions) for (const ref of references(expr)) refs.add(ref);
+        for (const param of parameters) refs.delete(param);
+        const failed = failedRef(refs);
+        if (!failed) continue;
+        const owner = ownerOf(name);
+        if (!errors.has(owner)) errors.set(owner, `${failed} has an error in its definition.`);
+        remove(name);
+        changed = true;
+      }
+    }
+    // Initial conditions retain their established recoverable behavior: an
+    // invalid component gets the zero seed, while its state and valid sibling
+    // seeds survive. Direct tuple sources preserve per-component provenance.
+    for (const [name, state] of defs.states) {
+      const owner = ownerOf(name);
+      let source = parsed.get(`${owner}(0)`);
+      if (source?.kind === 'vec' && vecOwnerKey.has(name)) {
+        source = source.items[vecStateComps(owner, defs.vecStates.get(owner)!).indexOf(name)];
+      }
+      const refs = references(state.init);
+      if (source) for (const ref of references(source)) refs.add(ref);
+      const failed = failedRef(refs);
+      if (!failed) continue;
+      const row = `${owner}(0)`;
+      if (!errors.has(row)) errors.set(row, `${failed} has an error in its definition.`);
+      defs.states.set(name, { deriv: state.deriv, init: num(0) });
+    }
+  }
+
+  const env = new Env(defs.sequences, defs.sequencePrefix);
+  const components = (values: Expr[]): Components => {
+    if (values.length !== 2 && values.length !== 3) throw new Error('A vector needs 2 or 3 components.');
+    return values as unknown as Components;
+  };
+  for (const [role, store] of [
+    ['const', defs.consts],
+    ['field', defs.fields],
+  ] as const) {
+    for (const [name, expr] of store) {
+      const owner = compOwner.get(name);
+      if (!owner) env.bind(name, { tag: 'scalar', role, expr });
+      else if (!env.names.has(owner)) {
+        env.bind(owner, {
+          tag: 'vector',
+          role,
+          components: components(pointComps(owner, defs.pointDims.get(owner)).map(c => store.get(c)!)),
+        });
+      }
+    }
+  }
+  for (const [name, state] of defs.states) {
+    const owner = vecOwnerKey.get(name);
+    if (!owner) env.bind(name, { tag: 'scalar', role: 'state', ...state });
+    else if (!env.names.has(owner)) {
+      const values = vecStateComps(owner, defs.vecStates.get(owner)!).map(c => defs.states.get(c)!);
+      env.bind(owner, {
+        tag: 'vector',
+        role: 'state',
+        deriv: components(values.map(s => s.deriv)),
+        init: components(values.map(s => s.init)),
+      });
+    }
+  }
+  for (const [name, expr] of defs.complexes) env.bind(name, { tag: 'scalar', role: 'complex', expr });
+  for (const [name, expr] of defs.conditions) env.bind(name, { tag: 'scalar', role: 'condition', expr });
+  for (const [name, fn] of defs.fns) env.bind(name, { tag: 'fn', fn });
+  for (const [name, matrix] of defs.mats) env.bind(name, { tag: 'matrix', matrix });
+  for (const [name, tensor] of defs.tensors) env.bind(name, { tag: 'tensor', tensor });
+  for (const [name, value] of defs.intervals) env.bind(name, { tag: 'interval', value });
+  for (const [name, value] of defs.multivectors) env.bind(name, { tag: 'multivector', value });
+  for (const [name, table] of defs.tables)
+    env.bind(name, { tag: 'table', table, unavailable: defs.missingData.get(name) });
+  for (const [name, value] of defs.lists)
+    env.bind(name, {
+      tag: 'seq',
+      value:
+        value.kind === 'vec'
+          ? { representation: 'scatter', vector: value }
+          : { representation: 'sequence', sequence: value },
+    });
+  for (const [name, missing] of defs.missingData) {
+    if (!defs.tables.has(name)) env.bind(name, { tag: 'missing', ...missing });
+  }
+  return { defs: env, fits, errors, needsFile, sumBoundConsts: ropts.boundConsts! };
+}
+
+/**
+ * Constants with no fixed value: those depending on t or on a state, directly
+ * or through other constants. (Σ/Π bounds may not use them — expansion is
+ * static.)
+ */
+export function animatedConstNames(defs: Env): Set<string> {
+  const out = new Set<string>();
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [name, e] of defs.consts) {
+      if (out.has(name)) continue;
+      for (const fv of freeVars(e)) {
+        if (fv === 't' || out.has(fv) || defs.states.has(fv)) {
+          out.add(name);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Names read by a value, including indirect constant and state dependencies. */
+export function definitionDependencies(names: Iterable<string>, defs: Env): Set<string> {
+  const out = new Set<string>();
+  const visit = (name: string) => {
+    if (out.has(name)) return;
+    out.add(name);
+    const constant = defs.consts.get(name);
+    const state = defs.states.get(name);
+    for (const e of constant ? [constant] : state ? [state.deriv, state.init] : []) {
+      for (const fv of freeVars(e)) visit(fv);
+    }
+  };
+  for (const name of names) visit(name);
+  return out;
+}
+
+/** Total time derivative, keeping constants symbolic and using state rates. */
+export function timeDifferentiator(defs: Env): (e: Expr) => Expr {
+  const rates = new Map<string, Expr>();
+  const zero: Expr = { kind: 'num', value: 0 };
+  const rate = (name: string): Expr => {
+    if (name === 't') return { kind: 'num', value: 1 };
+    const state = defs.states.get(name);
+    if (state) return state.deriv;
+    const constant = defs.consts.get(name);
+    if (!constant) return zero;
+    let hit = rates.get(name);
+    if (!hit) {
+      hit = derivative(constant);
+      rates.set(name, hit);
+    }
+    return hit;
+  };
+  const derivative = (e: Expr): Expr => {
+    let out: Expr = zero;
+    for (const name of freeVars(e)) {
+      const dt = rate(name);
+      // Fixed parameters need no differentiation, even if their definitions
+      // use functions without symbolic derivatives, such as floor().
+      if (dt.kind !== 'num' || dt.value !== 0) out = add(out, mul(diff(e, name), dt));
+    }
+    return out;
+  };
+  return derivative;
+}
+
+/** True when any constant depends on time and so must be re-evaluated per frame. */
+export function constsAnimated(defs: Env): boolean {
+  for (const e of defs.consts.values()) if (freeVars(e).has('t')) return true;
+  return false;
+}

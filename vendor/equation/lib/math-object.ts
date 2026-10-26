@@ -1,0 +1,410 @@
+/** Mathematical objects contain source expressions, never backend programs.
+ * Semantic properties and collections are readonly, enforced by the type
+ * checker rather than at runtime: objects are shared by reference, never
+ * copied or frozen. Packed numeric buffers are zero-copy, read-only by
+ * convention.
+ */
+import type { Column, Expr } from './expr.ts';
+import type { ProbBounds } from './dist.ts';
+import type { IntShade } from './intshade.ts';
+import type { GeodesicSpec } from './surface-geometry.ts';
+
+export type ColorSpace = 'rgb' | 'hsl' | 'oklch';
+
+export type Components = readonly [Expr, Expr] | readonly [Expr, Expr, Expr];
+export type PointSource =
+  | { readonly representation: 'real'; readonly coordinates: Components }
+  | { readonly representation: 'complex'; readonly expr: Expr };
+export type SystemSource =
+  | { readonly representation: 'real'; readonly residuals: Components }
+  | { readonly representation: 'complex'; readonly equation: Expr };
+export interface LevelSetSpec {
+  readonly name: string;
+  readonly expr: Expr;
+  readonly params: readonly string[];
+  readonly level?: string;
+}
+export type MathObject =
+  | {
+      readonly kind: 'curve';
+      readonly form: 'graph';
+      readonly rhs: Expr;
+      readonly equation: Expr;
+      readonly levels?: LevelSetSpec;
+    }
+  | {
+      readonly kind: 'curve';
+      readonly form: 'implicit';
+      readonly residual: Expr;
+      readonly equation?: Expr;
+      readonly levels?: LevelSetSpec;
+    }
+  | { readonly kind: 'curve'; readonly form: 'parametric'; readonly source: PointSource; readonly tube?: Expr }
+  | {
+      readonly kind: 'surface';
+      readonly form: 'implicit';
+      readonly residual: Expr;
+      readonly equation?: Expr;
+      /** A plane of projective geometry (lib/pga.ts): a x + b y + c z + d = 0
+       *  as [a, b, c, d], which the renderer draws translucent and outlined
+       *  where it meets the box, rather than raymarching the residual. */
+      readonly plane?: readonly [Expr, Expr, Expr, Expr];
+    }
+  | {
+      readonly kind: 'surface';
+      readonly form: 'parametric';
+      readonly coordinates: readonly [Expr, Expr, Expr];
+      /** A scalar in u and v the surface is coloured by, diverging about 0
+       *  (gaussian(S) alone on a row). */
+      readonly paint?: Expr;
+    }
+  | { readonly kind: 'intersection'; readonly residuals: readonly [Expr, Expr] }
+  | {
+      readonly kind: 'region';
+      readonly form?: undefined;
+      readonly constraints: ReadonlyArray<{ readonly residual: Expr; readonly strict: boolean }>;
+    }
+  /** The filled region two parameters trace, u and v each over [0, 1]:
+   *  `(u cos(2 pi v), u sin(2 pi v))` is the unit disc. */
+  | { readonly kind: 'region'; readonly form: 'parametric'; readonly coordinates: readonly [Expr, Expr] }
+  /** The region a family over an interval sweeps (lib/plot.ts
+   *  projectedRegion): the points where some u in [0, 1] makes the residual
+   *  vanish (`eq`), or every constraint negative (`ineq`). */
+  | {
+      readonly kind: 'region';
+      readonly form: 'projected';
+      readonly relation: 'eq' | 'ineq';
+      readonly constraints: ReadonlyArray<{ readonly residual: Expr; readonly strict: boolean }>;
+    }
+  /** A bare expression in the plane, or in space (`dimension: 3`), drawn as
+   *  a shade or a translucent cloud. */
+  | {
+      readonly kind: 'scalar-field';
+      readonly expr: Expr;
+      readonly dimension?: 3;
+      /** Shaded with a gain that brings its typical size on the panel's
+       *  surface (or over the view) to about 1, rather than as it stands:
+       *  gaussian(x, y). */
+      readonly autoscale?: true;
+    }
+  | { readonly kind: 'color-field'; readonly space: ColorSpace; readonly channels: readonly Expr[] }
+  | { readonly kind: 'vector-field'; readonly components: Components }
+  /** A 2×2 matrix over the plane, row-major: each glyph is the image of a
+   *  small circle under the matrix there, with a spoke where e_x goes. */
+  | {
+      readonly kind: 'tensor-field';
+      readonly entries: readonly [Expr, Expr, Expr, Expr];
+      /** streamlines(M): drawn along the major eigenvector, not as glyphs. */
+      readonly streamlines?: true;
+      /** On mapped axes (lib/axis-map.ts), the entries are read at the
+       *  screen point and this is the maps' Jacobian ∂(x, y)/∂(X, Y) there,
+       *  row-major, which carries the matrix and its eigenvectors onto the
+       *  screen. */
+      readonly jacobian?: readonly [Expr, Expr, Expr, Expr];
+    }
+  | { readonly kind: 'complex-field'; readonly form: 'potential' | 'domain' | 'conformal'; readonly expr: Expr }
+  | {
+      readonly kind: 'complex-field';
+      readonly form: 'fractal';
+      readonly step: Expr;
+      readonly seed: 'pixel' | 'zero';
+      readonly maxIter: number;
+    }
+  | { readonly kind: 'point'; readonly source: PointSource }
+  | { readonly kind: 'trail'; readonly coordinates: Components }
+  | { readonly kind: 'label'; readonly coordinates: Components; readonly text: string }
+  /** Where states go over [from, to], integrated ahead of time (orbit.ts):
+   *  one path per run, each a point's coordinates or, for a series, the one
+   *  value drawn against t. */
+  | {
+      readonly kind: 'orbit';
+      readonly paths: readonly (readonly Expr[])[];
+      readonly series: boolean;
+      readonly from: Expr;
+      readonly to: Expr;
+    }
+  /** A geodesic of a parametric surface from a start in a direction,
+   *  integrated as it is drawn (lib/surface-geometry.ts geodesicPath). */
+  | ({ readonly kind: 'geodesic' } & GeodesicSpec)
+  /** `vertices` flat, or with `over` one vertex template run over the columns. */
+  | {
+      readonly kind: 'figure';
+      readonly form: 'segment' | 'polyline' | 'vector' | 'polygon' | 'square' | 'hull';
+      readonly dimension: 2 | 3;
+      readonly vertices: readonly Expr[];
+      readonly over?: readonly Column[];
+    }
+  | {
+      readonly kind: 'system';
+      readonly source: SystemSource;
+      readonly parametric?: boolean;
+      readonly angular?: readonly boolean[];
+      readonly coordinates?: readonly Expr[];
+    }
+  | { readonly kind: 'sequence'; readonly form: 'explicit'; readonly term: Expr; readonly index: string }
+  | {
+      readonly kind: 'sequence';
+      readonly form: 'cobweb';
+      readonly expr: Expr;
+      readonly variable: string;
+      readonly seedName?: string;
+    }
+  | {
+      readonly kind: 'sequence';
+      readonly form: 'bifurcation';
+      readonly expr: Expr;
+      readonly variable: string;
+      readonly seedName?: string;
+    }
+  /** A cellular automaton (lib/automaton.ts): `rule` reads the previous
+   *  generation's cells within `radius`; `seed` is generation 0 as an
+   *  expression in its cells. `dims` 1 draws the space-time diagram, 2 one
+   *  generation of a board. `axes` names the lattice's across and down
+   *  indices as written (`c_{n+1}[i]` is i, n; `L_{n+1}[i, j]` is i, j). */
+  | {
+      readonly kind: 'automaton';
+      readonly rule: Expr;
+      readonly radius: number;
+      readonly seed?: Expr;
+      readonly dims: 1 | 2;
+      readonly axes: readonly [string, string];
+    }
+  /** A function on the integer lattice, `T[i, j] = …` (lib/automaton.ts):
+   *  `expr` reads CELL_VAR and CELL_VAR2. Or, with `rows`, cells already
+   *  computed: row k's position h (from 1) is rows[k][h − 1] — a
+   *  tuple-valued recurrence's terms (lib/seq.ts). */
+  | {
+      readonly kind: 'lattice';
+      readonly expr: Expr;
+      readonly axes: readonly [string, string];
+      readonly rows?: readonly (readonly number[])[];
+    }
+  /** `graph(from, to)` / `graph(from, to, label)` (lib/graph.ts): one edge
+   *  per element of the tuple's multiset, each [from, to] or [from, to, label]. */
+  | { readonly kind: 'graph'; readonly edges: ReadonlyArray<readonly Expr[]> }
+  | {
+      readonly kind: 'list';
+      readonly element: 'scalar';
+      readonly storage: 'expressions';
+      readonly values: readonly Expr[];
+    }
+  | { readonly kind: 'list'; readonly element: 'scalar'; readonly storage: 'packed'; readonly values: Float64Array }
+  | {
+      readonly kind: 'list';
+      readonly element: 'point';
+      readonly storage: 'expressions';
+      readonly dimension: 2 | 3;
+      readonly values: ReadonlyArray<readonly Expr[]>;
+    }
+  /** Complex numbers (`e^(iπ [0..5]/5)`), drawn on the Argand plane as one
+   *  complex value is: each member at (re, im). */
+  | {
+      readonly kind: 'list';
+      readonly element: 'complex';
+      readonly storage: 'expressions';
+      readonly values: readonly Expr[];
+    }
+  | {
+      readonly kind: 'list';
+      readonly element: 'point';
+      readonly storage: 'packed';
+      readonly dimension: 2 | 3;
+      readonly coordinates: readonly Float64Array[];
+    }
+  | {
+      readonly kind: 'histogram';
+      readonly centers: Float64Array;
+      readonly counts: Float64Array;
+      readonly width: number;
+    }
+  /** `mass` multiplies the drawn density or pmf: the length of a row's
+   *  intervals, whose multiplicity is a measure, not a probability. */
+  | {
+      readonly kind: 'distribution';
+      readonly form: 'density' | 'pmf' | 'expect';
+      readonly rv: string;
+      readonly mass?: Expr;
+    }
+  | {
+      readonly kind: 'distribution';
+      readonly form: 'prob';
+      readonly body: Expr;
+      readonly shade?: Readonly<{ rv: string } & ProbBounds>;
+    }
+  | { readonly kind: 'value'; readonly expr: Expr; readonly shade?: Readonly<IntShade> }
+  /** A tuple of more than 3 numbers: values at positions, with no picture
+   *  (2 or 3 of them are a point). Shown as its readout (docs/multisets.md §3).
+   *  A matrix or tensor is a tuple of tuples, its values row-major under
+   *  `shape`; `count` of them back to back are a multiset of tensors (§4).
+   *  `length`: a long tuple of numbers (a sorted column) keeps only the
+   *  values its readout shows, and says how many it has. */
+  | {
+      readonly kind: 'tuple';
+      readonly values: readonly Expr[];
+      readonly shape?: readonly number[];
+      readonly count?: number;
+      readonly length?: number;
+      /** The values are a multivector's coefficients, by blade bitmask, read
+       *  out as `1 + 2 e_xy` (or in i, j, k) rather than as a tuple. */
+      readonly blades?: { readonly dim: 2 | 3; readonly quat?: true };
+      /** The values are the coefficients of a point, line or plane of
+       *  projective geometry (lib/pga.ts), `grade` saying which, read out
+       *  as the point or the equation it is rather than as a tuple. */
+      readonly flat?: { readonly dim: 2 | 3; readonly grade: number };
+    }
+  // `constant`: the row reads like a slider named e, pi or i (see
+  // takenDefinitionName), which the readout explains. `identity`: an equation
+  // in x, y, z or t whose sides agree everywhere (see holdsEverywhere).
+  | {
+      readonly kind: 'note';
+      readonly expr: Expr;
+      readonly variable: boolean;
+      readonly constant?: string;
+      readonly identity?: true;
+    }
+  | {
+      readonly kind: 'family';
+      readonly members: readonly Classified[];
+      readonly shared?: { readonly classified: Classified; readonly index: string };
+      /** What the row reads out while its members draw: a multivector's
+       *  value beside its grade glyphs, or action(M)'s matrix beside the
+       *  image of the unit square (lib/glyphs.ts). */
+      readonly readout?: Classified;
+      /** The members are the faces of one solid over three parameters
+       *  (lib/plot.ts solidFaces), drawn opaque so only its outside shows. */
+      readonly solid?: true;
+    };
+
+export interface Classified {
+  readonly object: MathObject;
+  readonly animated: boolean;
+  readonly needs3D: boolean;
+  readonly params: readonly string[];
+  /** On a plane-mapped panel (lib/plane-map.ts), the row as written, in x
+   *  and y, before the map was put in: what hover reads intercepts and
+   *  extrema from, placing them on the screen through the map. */
+  readonly world?: MathObject;
+}
+
+/** Stable public compatibility API; backend selection never changes it. */
+export function publicKind(object: MathObject) {
+  switch (object.kind) {
+    case 'curve':
+      return object.form === 'parametric' ? 'pcurve' : 'implicit2d';
+    case 'surface':
+      return object.form === 'parametric' ? 'psurface' : 'implicit3d';
+    case 'intersection':
+      return 'spacecurve';
+    case 'region':
+      return object.form === 'parametric' ? 'pregion' : object.form === 'projected' ? 'projected2d' : 'ineq2d';
+    case 'scalar-field':
+      return object.dimension === 3 ? 'scalar3d' : 'scalar2d';
+    case 'color-field':
+      return `${object.space}2d` as const;
+    case 'vector-field':
+      return object.components.length === 3 ? 'vfield3d' : 'vfield2d';
+    case 'tensor-field':
+      return 'tfield2d';
+    case 'complex-field':
+      switch (object.form) {
+        case 'potential':
+          return 'complex2d';
+        case 'domain':
+          return 'domain2d';
+        case 'conformal':
+          return 'conformal2d';
+        case 'fractal':
+          return 'fractal2d';
+      }
+    case 'figure':
+      return 'polygon';
+    case 'family':
+      // One multivector or matrix drawn as several glyphs is not a list.
+      if (object.readout?.object.kind === 'tuple' && object.readout.object.flat) return 'flat';
+      if (object.readout)
+        return object.readout.object.kind === 'tuple' && object.readout.object.blades ? 'multivector' : 'action';
+      if (object.solid) return 'solid';
+      return 'family';
+    case 'sequence':
+      return object.form === 'explicit' ? 'sequence' : object.form;
+    case 'list':
+      return object.element === 'scalar'
+        ? object.storage === 'packed'
+          ? 'dlist'
+          : 'vlist'
+        : object.storage === 'packed'
+          ? 'dscatter'
+          : 'plist';
+    case 'distribution':
+      return object.form;
+    case 'point':
+    case 'trail':
+    case 'label':
+    case 'orbit':
+    case 'geodesic':
+    case 'system':
+    case 'histogram':
+    case 'value':
+    case 'tuple':
+    case 'note':
+    case 'automaton':
+    case 'lattice':
+    case 'graph':
+      return object.kind;
+  }
+}
+export type PublicKind = ReturnType<typeof publicKind>;
+
+export function components(items: readonly Expr[]): Components {
+  if (items.length !== 2 && items.length !== 3) throw new Error('A point or vector needs 2 or 3 components.');
+  return items as Components;
+}
+
+export function objectNeeds3D(object: MathObject): boolean {
+  switch (object.kind) {
+    case 'surface':
+    case 'intersection':
+      return true;
+    case 'point':
+      return object.source.representation === 'real' && object.source.coordinates.length === 3;
+    case 'curve':
+      return (
+        object.form === 'parametric' &&
+        object.source.representation === 'real' &&
+        object.source.coordinates.length === 3
+      );
+    case 'vector-field':
+      return object.components.length === 3;
+    case 'scalar-field':
+      return object.dimension === 3;
+    case 'trail':
+    case 'label':
+      return object.coordinates.length === 3;
+    case 'orbit':
+      return !object.series && object.paths[0]?.length === 3;
+    case 'geodesic':
+      return object.dim === 3;
+    case 'figure':
+      return object.dimension === 3;
+    case 'system':
+      return object.source.representation === 'real' && object.source.residuals.length === 3;
+    case 'list':
+      return object.element === 'point' && object.dimension === 3;
+    case 'family':
+      return object.members.some(member => member.needs3D);
+    case 'region':
+    case 'tensor-field':
+    case 'color-field':
+    case 'complex-field':
+    case 'sequence':
+    case 'automaton':
+    case 'lattice':
+    case 'graph':
+    case 'histogram':
+    case 'distribution':
+    case 'value':
+    case 'tuple':
+    case 'note':
+      return false;
+  }
+}

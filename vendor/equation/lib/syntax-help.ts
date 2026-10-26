@@ -1,0 +1,415 @@
+import { type Env } from './env.ts';
+/** Pure, tolerant editor assistance. Suggestions write ordinary equation
+ * text; an incomplete expression never needs to pass through the parser.
+ */
+import { pointComponentNames, shadowedNames } from './defs.ts';
+import { DIST_FAMILIES, distFamily, distUsage, isModelName } from './dist-families.ts';
+import { tildeRow } from './regression.ts';
+import {
+  FUNCTIONS,
+  NAME_SRC,
+  NAME_START_CHARS,
+  WRITTEN_NAME_CHARS,
+  builtinFn,
+  canonicalName,
+  freeVars,
+} from './expr.ts';
+import { pointComps } from './geom.ts';
+import { ESCAPES } from './escapes.ts';
+import { VALUE_END, noteStart } from './statements.ts';
+
+export interface Suggestion {
+  name: string;
+  signature: string;
+  description: string;
+  call: boolean;
+  /** Replacement text when it differs from `name`: \pi inserts π. */
+  insert?: string;
+}
+
+/** The name a '(' follows, for call signatures. */
+const CALL_NAME_RE = new RegExp(String.raw`(${NAME_SRC})\s*$`);
+/** The head of a ~ row's right side. */
+const HEAD_NAME_RE = new RegExp(String.raw`^\s*(${NAME_SRC})\s*\($`);
+/** The (possibly dotted) name under the caret, as written. */
+const WORD_RE = new RegExp(`[${NAME_START_CHARS}][${WRITTEN_NAME_CHARS}.]*(?:\\.[${WRITTEN_NAME_CHARS}]*)?$`);
+const WORD_END_RE = new RegExp(`^[${WRITTEN_NAME_CHARS}.]*`);
+export interface SyntaxHelp {
+  start: number;
+  end: number;
+  suggestions: Suggestion[];
+  hint?: string;
+}
+
+const signatures: Record<string, [string, string]> = {
+  view: [
+    'view(x = lo..hi, y = lo..hi, ratio = 1)',
+    'Frame the graph; ratio is pixels per y unit / pixels per x unit. A lattice panel is framed by its index names: view(i = -60..60, n = 0..80)',
+  ],
+  grid: ['grid(off | axes | r, theta)', "What draws behind the panel's plots: nothing, the axes, or named coordinates"],
+  sin: ['sin(x)', 'Sine; angles in radians'],
+  cos: ['cos(x)', 'Cosine; angles in radians'],
+  tan: ['tan(x)', 'Tangent; angles in radians'],
+  sqrt: ['sqrt(x)', 'Square root'],
+  ln: ['ln(x)', 'Natural logarithm'],
+  log: ['log(x)', 'Base-10 logarithm'],
+  log2: ['log2(x)', 'Base-2 logarithm'],
+  atan2: ['atan2(y, x)', 'Angle of the point (x, y)'],
+  normalpdf: ['normalpdf(x, mean, sd)', 'Normal probability density'],
+  normalcdf: ['normalcdf(x, mean, sd)', 'Normal cumulative probability'],
+  mean: ['mean(L)', 'Mean of a numeric list or column; over a set, mean({y = x^2, 0 < x < 1: y})'],
+  stdev: ['stdev(L)', 'Standard deviation of a numeric list'],
+  median: ['median(L)', 'Median of a numeric list'],
+  total: ['total(L)', 'Sum of a numeric list; over a continuous set an integral: total(u^2) = 1/3'],
+  count: [
+    'count(L)',
+    'Number of elements in a list; of a filter its measure: count(L > 2), count(x^2 + y^2 < 1) = π, count(x^2 = 2) = 2',
+  ],
+  hist: ['hist(L)', 'Histogram of a numeric list'],
+  fourier: [
+    'fourier(signal, samples = 256)',
+    'One-sided amplitude spectrum of a real signal over an interval (its period), s = interval(0, 1); fourier(sin(2pi s)), or of ordered samples; CSV: sort(data.signal, data.row)',
+  ],
+  reconstruct: [
+    'reconstruct(signal, N, samples = 256)',
+    'Periodic Fourier approximation in x of a signal over an interval, including the mean and the first N harmonics (0–128); samples use their own count',
+  ],
+  interval: [
+    'interval(a, b)',
+    'Every real number from a to b: r = interval(1, 2); (r cos(2pi u), r sin(2pi u)) fills an annulus',
+  ],
+  sort: ['sort(L) or sort(P, P.x)', 'A list in ascending order, as a tuple; points by a key written in them'],
+  push: ['push(s, a)', 'The tuple s with a appended: a stack s_{n+1} = push(s_n, a)'],
+  pop: ['pop(s)', 'The tuple s without its last element'],
+  top: ['top(s)', 'The last element of the tuple s'],
+  min: ['min(a, b) or min(L)', 'Minimum'],
+  max: ['max(a, b) or max(L)', 'Maximum'],
+  clamp: ['clamp(x, lo, hi)', 'x held within [lo, hi]; as a constant, a slider over that range'],
+  mod: ['mod(a, b)', 'Remainder modulo b'],
+  gcd: ['gcd(a, b)', 'Greatest common divisor'],
+  isprime: ['isprime(n)', '1 when n is a prime, else 0'],
+  graph: [
+    'graph(from, to) or graph(from, to, label)',
+    'Arrows between numbered vertices; lists combine as a tuple: k = [0..11]; graph(k, mod(k + 1, 12))',
+  ],
+  mark: ['mark(v)', 'Highlight vertex v in the graphs of its panel'],
+  segment: ['segment(A, B)', 'Segment joining two 2D or 3D points'],
+  polyline: ['polyline(A, B, C, …)', 'Open path through 2D/3D points; also polyline(T) for a tuple, like sort(P, P.x)'],
+  vector: ['vector(A, B) or vector(V)', 'Arrow from A to B, or from the origin to V'],
+  line: ['line(A, B)', 'Line through two points, in the plane or in space'],
+  join: [
+    'join(A, B) or join(A, B, C)',
+    'The line through two points, or the plane through three (or a point and a line)',
+  ],
+  meet: ['meet(L, M)', 'Where two lines of the plane cross; in space where a line meets a plane, or two planes cross'],
+  plane: ['plane(A, B, C) or plane(P, n)', 'The plane through three points, or through P with normal n'],
+  project: ['project(P, L)', 'The point of a line or plane nearest P'],
+  reflect: ['reflect(P, L)', 'P mirrored in a line, a plane or a point'],
+  circle: ['circle(A, r)', 'Circle with center A and radius r'],
+  polygon: [
+    'polygon(A, B, C, …)',
+    'Polygon through points or a tuple of them; 3D triangles fill, larger 3D polygons outline',
+  ],
+  square: ['square(A, B)', 'Square erected to the left of side A → B'],
+  midpoint: ['midpoint(A, B)', 'Midpoint of two points'],
+  distance: ['distance(A, B)', 'Distance between two points, |A - B|, or from a point to a line or plane'],
+  angle: [
+    'angle(A, B, C) or angle(U, V); angle(L, M)',
+    'Angle at B, or between U and V: signed in 2D (−π, π], unsigned in 3D [0, pi]; between lines or planes, acute',
+  ],
+  dot: ['dot(A, B)', 'Vector dot product'],
+  cross: [
+    'cross(A, B) or cross(n)',
+    'Vector cross product; cross(n) alone is the rotation generator about n, as in e^(a cross(n)) v',
+  ],
+  hull: ['hull(A, B, C, …) or hull(P)', 'Convex hull of points or a point list: a filled polygon in 2D, a solid in 3D'],
+  rotate: [
+    'rotate(P, angle), rotate(P, angle, center), rotate(P, angle, axis) or rotate(X, M)',
+    'Turn a point: about the origin or a center in 2D, about an axis in 3D; or move X by the motor M',
+  ],
+  det: ['det(M)', 'Matrix determinant'],
+  trace: ['trace(M)', 'Matrix trace'],
+  transpose: ['transpose(M)', 'Matrix transpose: rows become columns'],
+  solve: ['solve(M, v)', 'Solve the linear system M x = v'],
+  outer: ['outer(a, b) or a ⊗ b', 'Outer (tensor) product: (a ⊗ b)_ij = a_i b_j, of vectors, matrices or tensors'],
+  wedge: ['wedge(a, b) or a ∧ b', 'Wedge product a ⊗ b − b ⊗ a: a bivector, read out as its antisymmetric matrix'],
+  contract: ['contract(T, i, j)', 'Sum a tensor over indices i = j (1-based): contract(M, 1, 2) is trace(M)'],
+  action: ['action(M)', 'Draw what a 2×2 or 3×3 matrix does to the unit square, circle and axes'],
+  streamlines: [
+    'streamlines(M)',
+    'Draw a 2×2 matrix field in x, y as streamlines of its major eigenvector instead of glyphs',
+  ],
+  jacobian: ['jacobian((f, g))', 'The matrix of partial derivatives of a map; a 2×2 in x, y draws as glyphs'],
+  hessian: ['hessian(f)', 'The matrix of second partial derivatives of a scalar field'],
+  curvature: [
+    'curvature(C) or curvature(C, u0)',
+    'Curvature of a curve in u: signed in the plane, along u or at u = u0',
+  ],
+  torsion: ['torsion(C) or torsion(C, u0)', 'Torsion of a space curve in u: how fast it twists out of its plane'],
+  osculating: ['osculating(C, u0)', 'The osculating circle of a curve in u at u = u0: radius 1/κ, on the concave side'],
+  frame: ['frame(C, u0)', 'The Frenet frame of a curve in u at u = u0: unit T and N, and B in 3D'],
+  gaussian: [
+    'gaussian(S) or gaussian(S, u0, v0)',
+    'Gaussian curvature K of a surface in u, v; alone on a row it colours S by K. On an on(…) panel, gaussian(x, y) paints K',
+  ],
+  geodesic: [
+    'geodesic(S, (u0, v0), (du, dv)) or geodesic(S, P, d, length)',
+    'The geodesic of a surface in u, v from a point in a direction; on an on(…) panel, geodesic(P, (dx, dy))',
+  ],
+  meancurvature: [
+    'meancurvature(S) or meancurvature(S, u0, v0)',
+    'Mean curvature H of a surface in u, v, with normal ∂S/∂u × ∂S/∂v; alone on a row it colours S by H',
+  ],
+  gp: ['gp(a, b) or a ⟑ b', 'Geometric product of vectors or multivectors: e_x ⟑ e_y is the bivector e_xy'],
+  rev: ['rev(A)', 'Reverse a multivector: R p rev(R) turns p by the rotor R'],
+  grade: ['grade(A, k)', 'The grade-k part of a multivector: grade(A, 1) is its vector'],
+  dual: ['dual(A)', 'The dual A I⁻¹: dual(e_xy) is e_z'],
+  vec: ['vec(q)', 'A quaternion’s vector part (x, y, z), as a point'],
+  quat: ['quat(w, x, y, z)', 'The quaternion w + x i + y j + z k; quat(cos(a/2), sin(a/2) n) turns by a about n'],
+  slerp: [
+    'slerp(q1, q2, s)',
+    'Turn from rotation q1 to q2 at constant speed, s from 0 to 1 — or move from motor M1 to M2 along their screw',
+  ],
+  motor: [
+    'motor(L, angle, slide) or motor(P, angle)',
+    'A rigid motion: turn about the line L and slide along it (a screw), or turn the plane about P; rotate(X, M) applies it',
+  ],
+  sum: ['sum(n=1..N, expression)', 'Finite sum'],
+  prod: ['prod(n=1..N, expression)', 'Finite product'],
+  int: ['int[a..b] f(x) dx', 'Definite integral; bounds may be omitted. Alone on a row it shades its signed area'],
+  domain: ['domain(f(w))', 'Complex domain coloring'],
+  rgb: ['rgb(red, green, blue, opacity?)', '2D color field; real channels from 0 to 1'],
+  hsl: ['hsl(hue, saturation, lightness, opacity?)', '2D color field; hue in radians, saturation and lightness 0–1'],
+  oklch: [
+    'oklch(lightness, chroma, hue, opacity?)',
+    '2D color field; lightness 0–1, chroma typically 0–0.4, hue in radians',
+  ],
+  conformal: ['conformal(f(w))', 'Image of a complex coordinate grid'],
+  iter: ['iter(w^2 + c)', 'Complex escape-time iteration'],
+  grad: ['grad(f) or ∇f', 'Gradient in 2D or 3D, plotted as a vector field'],
+  div: ['div(F) or ∇·F', 'Divergence of a 2D or 3D vector field, a scalar field'],
+  curl: ['curl(F) or ∇×F', 'Curl: a scalar ∂F₂/∂x − ∂F₁/∂y in 2D, a vector field in 3D'],
+  laplacian: ['laplacian(f) or ∇²f', 'Laplacian of a scalar field: the sum of its second partial derivatives'],
+  trail: ['trail(point)', 'Draw a moving point’s path'],
+  label: ['label(point, "text")', 'Write text beside a point on the graph'],
+  tube: ['tube((x(u), y(u), z(u)))', 'Tube along a parametric space curve'],
+  revolve: ['revolve(f(x))', 'Surface of revolution of y = f(x) about the x-axis; revolve(f(y), y) about the y-axis'],
+  open: ['data = open("file.csv")', 'Use a CSV file dropped onto the graph'],
+  ...Object.fromEntries(DIST_FAMILIES.map(f => [f.name, [`X ~ ${distUsage(f)}`, `Declare ${f.help}`]])),
+  P: [
+    'P(X < b)',
+    'Probability of a random-variable condition, joint ones included: P(X > Y). Over discrete variables < and <= differ, P(X = k) is a stem’s height, and P(X = Y) counts the ties',
+  ],
+  E: ['E(X)', 'Expected value of a random variable or of an expression in them: E(X Y) — exact over discrete ones'],
+};
+
+/** A built-in function's signature and description, as autocomplete shows
+ *  them; case folds as the parser folds it (`Sin` is sin). The call forms
+ *  that are not functions — P(…), view(…), a distribution — only count when
+ *  `called`: bare, `n` is a sum's index, not Normal by its alias N. */
+export function builtinHelp(name: string, called = true): { signature: string; description: string } | null {
+  const key =
+    builtinFn(name) ?? (!called ? null : Object.hasOwn(signatures, name) ? name : (distFamily(name)?.name ?? null));
+  if (!key) return null;
+  const [signature, description] = signatures[key] ?? [`${key}(x)`, 'Built-in function'];
+  return { signature, description };
+}
+
+/** Distributions whose name folds case ANYWHERE in a row, not just at the
+ *  head of a ~: all but the spellings that also mean something else (Gamma →
+ *  the gamma function, Beta → a coefficient), which are laws only at the head. */
+const FOLDED_DISTS = DIST_FAMILIES.map(f => f.name).filter(n => !isModelName(n));
+
+/** Every name the definitions claim — the stand-in for declaredNames(texts)
+ *  when the caller has only the built Env. */
+const definedNames = (defs: Env): ReadonlySet<string> =>
+  new Set([
+    ...defs.consts.keys(),
+    ...defs.fns.keys(),
+    ...defs.fields.keys(),
+    ...defs.complexes.keys(),
+    ...defs.conditions.keys(),
+    ...defs.states.keys(),
+    ...defs.points,
+    ...defs.mats.keys(),
+    ...defs.tensors.keys(),
+    ...defs.multivectors.keys(),
+    ...defs.lists.keys(),
+    ...defs.tables.keys(),
+    ...defs.missingData.keys(),
+  ]);
+
+/** `declared`: the document's `name = …` names (regression.ts declaredNames),
+ *  which decide whether `Y ~ gamma(` is a model or a law exactly as the row
+ *  itself will be read; without it the built definitions stand in. */
+export function syntaxHelp(text: string, offset: number, defs: Env, declared?: ReadonlySet<string>): SyntaxHelp {
+  const empty: SyntaxHelp = { start: offset, end: offset, suggestions: [] };
+  if (text.trimStart().startsWith('#')) return empty;
+  // A trailing `# note` is prose: no help inside it, and none read from it.
+  const note = noteStart(text);
+  if (note >= 0) {
+    if (offset > note) return empty;
+    text = text.slice(0, note);
+  }
+  const before = text.slice(0, offset);
+  // Primes after identifiers/values are derivatives, not string delimiters.
+  let quote = '',
+    stack: Array<{ name?: string; at: number }> = [];
+  for (let i = 0; i < before.length; i++) {
+    const c = before[i];
+    if (quote) {
+      if (c === quote) quote = '';
+      continue;
+    }
+    if (c === '"' || (c === "'" && !VALUE_END.test(before[i - 1] ?? ''))) {
+      quote = c;
+      continue;
+    }
+    if ('([{'.includes(c)) {
+      // Canonicalize the captured call name so f₁( finds the f_1 signature.
+      const name = c === '(' ? CALL_NAME_RE.exec(before.slice(0, i))?.[1] : undefined;
+      stack.push({ name: name && canonicalName(name), at: i });
+    } else if (')]}'.includes(c)) stack.pop();
+  }
+  if (quote) return empty;
+  const candidates = new Map<string, Suggestion>();
+  for (const name of new Set([...FUNCTIONS, ...Object.keys(signatures)])) {
+    const [signature, description] = signatures[name] ?? [`${name}(x)`, 'Built-in function'];
+    candidates.set(name, { name, signature, description, call: true });
+  }
+  // Only parser-defined case-insensitive names participate in fallback.
+  // Snapshot before user definitions overwrite candidates: those names are
+  // exact, and must not acquire new spellings just because help is open.
+  const foldedBuiltins = new Map(
+    [...candidates]
+      .filter(([name]) => FUNCTIONS.has(name) || FOLDED_DISTS.includes(name))
+      .map(([name, suggestion]) => [name.toLowerCase(), suggestion]),
+  );
+  const values = (names: Iterable<string>, description: string) => {
+    for (const name of names) candidates.set(name, { name, signature: name, description, call: false });
+  };
+  // Built in, and replaced below by a document's own e_x.
+  values(['e_x'], 'Unit vector (1, 0, 0)');
+  values(['e_y'], 'Unit vector (0, 1, 0)');
+  values(['e_z'], 'Unit vector (0, 0, 1)');
+  values(['e_xy'], 'Bivector e_x ⟑ e_y: the unit plane of x and y');
+  values(['e_yz'], 'Bivector e_y ⟑ e_z');
+  values(['e_zx'], 'Bivector e_z ⟑ e_x');
+  values(['e_xyz'], 'Pseudoscalar e_x ⟑ e_y ⟑ e_z: the unit volume');
+  // (Not a named value's hidden coefficients, M#3: no row can write them.)
+  values(
+    [...defs.consts.keys()].filter(n => !n.includes('#')),
+    'Defined constant',
+  );
+  values(defs.states.keys(), 'Simulation state');
+  values(defs.vecStates.keys(), 'Vector state');
+  // A field over u, v is a named curve or surface (`c = (cos(2pi u), …)`).
+  const overParams = (name: string) => {
+    const vars = freeVars(defs.fields.get(name) ?? { kind: 'num', value: 0 });
+    return vars.has('u') || vars.has('v');
+  };
+  const pointOverParams = (p: string) => pointComps(p, defs.pointDims.get(p)).some(overParams);
+  const fields = [...defs.fields.keys()].filter(n => !pointComponentNames(defs).has(n));
+  values(
+    fields.filter(n => !overParams(n)),
+    'Coordinate field',
+  );
+  values(fields.filter(overParams), 'Parametric value');
+  values(defs.complexes.keys(), 'Defined complex number');
+  values(defs.conditions.keys(), 'Condition, read in braces: {name: value}');
+  values(
+    [...defs.points].filter(p => !pointOverParams(p)),
+    'Defined point',
+  );
+  values([...defs.points].filter(pointOverParams), 'Named curve or surface');
+  values(defs.mats.keys(), 'Defined matrix');
+  values(defs.tensors.keys(), 'Defined tensor');
+  values(defs.multivectors.keys(), 'Defined multivector');
+  values(defs.lists.keys(), 'Defined list');
+  for (const [name, table] of defs.tables) {
+    values([name], 'Data table');
+    for (const col of table.data?.columns ?? [])
+      values([`${name}.${col.name}`], `${col.type === 'num' ? 'Numeric' : 'Text'} column · ${table.file}`);
+  }
+  for (const [name, fn] of defs.fns)
+    candidates.set(name, {
+      name,
+      signature: `${name}(${fn.params.join(', ')})`,
+      description: 'Defined function',
+      call: true,
+    });
+  // \pi, \nabla, \trail, …: a \word suggests from the escape table instead
+  // (`start` covers the backslash). A function-name escape completes like
+  // the function itself — real signature, parens on accept — which makes a
+  // bare `\` a function search that works from the first letter, where the
+  // plain word path holds built-in calls back until two characters. A symbol
+  // escape carries `insert`, the replacement text for the whole \word.
+  const esc = /\\([A-Za-z]*)$/.exec(before);
+  if (esc && before[before.length - esc[0].length - 1] !== '\\') {
+    const start = offset - esc[0].length;
+    const end = offset + (/^[A-Za-z0-9]*/.exec(text.slice(offset))?.[0].length ?? 0);
+    const suggestions = ESCAPES.filter(s => s.name.startsWith(esc[1]))
+      .slice(0, 6)
+      .map(({ name, text: replacement, description }): Suggestion => {
+        const fn = candidates.get(replacement);
+        if (fn?.call) return { ...fn, signature: `${fn.signature}   \\${name}` };
+        return {
+          name: `\\${name}`,
+          signature: `${replacement}   \\${name}`,
+          description,
+          call: false,
+          insert: replacement,
+        };
+      });
+    const hint = suggestions.length
+      ? undefined
+      : '\\name inserts a symbol or function: \\pi → π, \\theta → θ, \\nabla → ∇ (\\\\ for a backslash)';
+    return { start, end, suggestions, hint };
+  }
+  const call = [...stack].reverse().find(s => s.name)?.name;
+  const shadowed = shadowedNames([...candidates.values()].filter(s => !s.call).map(s => s.name));
+  const blocked = call && !defs.fns.has(call) && shadowed.has(builtinFn(call) ?? '');
+  // The HEAD of a ~ row — the first token right of the ~, its paren the
+  // outermost one open — is a distribution name in any spelling, aliases
+  // included: `X ~ gamma(` is the Gamma law there. Anywhere deeper
+  // (`X ~ Normal(gamma(`, `Y ~ a gamma(`) a name means what it always does.
+  // Whether the row is a declaration at all is regression.ts's call (tildeRow,
+  // the predicate scanRegressions runs), so help and behaviour cannot differ.
+  const row = tildeRow(before, declared ?? definedNames(defs));
+  const head = row && !row.regression ? HEAD_NAME_RE.exec(before.slice(row.tilde + 1, (stack[0]?.at ?? -1) + 1)) : null;
+  const family =
+    head &&
+    row &&
+    stack[0].at > row.tilde &&
+    call === canonicalName(head[1]) &&
+    stack.filter(f => f.name).length === 1 &&
+    !defs.fns.has(call)
+      ? distFamily(call)
+      : undefined;
+  const distName = family?.name;
+  const entry = distName
+    ? candidates.get(distName)
+    : call && !blocked
+      ? (candidates.get(call) ?? foldedBuiltins.get(call.toLowerCase()))
+      : undefined;
+  let hint = entry?.call ? `${entry.signature} — ${entry.description}` : undefined;
+  if (!hint && before.includes('~'))
+    hint =
+      'Y ~ m X + b fits data lists: unbound coefficients are fitted, defined constants stay fixed. X ~ Normal(mean, sd) declares a random variable.';
+  const word = WORD_RE.exec(before)?.[0] ?? '';
+  if (!word) return { ...empty, hint };
+  const start = offset - word.length;
+  const end = offset + (WORD_END_RE.exec(text.slice(offset))?.[0].length ?? 0);
+  // Candidates live under canonical names, so T₀ matches (and becomes) T_0.
+  const canon = canonicalName(word);
+  const suggestions = [...candidates.values()]
+    .filter(
+      s =>
+        s.name.toLowerCase().startsWith(canon.toLowerCase()) &&
+        s.name !== canonicalName(text.slice(start, end)) &&
+        (word.length >= 2 || !s.call || defs.fns.has(s.name)),
+    )
+    .sort((a, b) => Number(a.call) - Number(b.call) || a.name.localeCompare(b.name))
+    .slice(0, 6);
+  return { start, end, suggestions, hint };
+}

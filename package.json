@@ -1,0 +1,13 @@
+{
+  "name": "scoreler-graphing-calculator",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.cjs",
+    "test": "node test.cjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}
